@@ -1,0 +1,7 @@
+MiAlgoritmo
+https://aicassindra.com/blogs/threading/threading_lock_free.html
+https://doc.rust-lang.org/std/sync/atomic/
+https://dev.to/axelncho/using-lmax-disruptor-to-build-a-high-performance-in-memory-event-broker-in-java-6i
+https://www.stanza.dev/courses/rust-concurrency/atomics/rust-concurrency-cas-patterns
+https://github.com/joaquinbejar/OrderBook-rs/blob/main/src/orderbook/book_change_event.rs
+LockFree-OCC-CAS
