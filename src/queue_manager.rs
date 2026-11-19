@@ -97,13 +97,19 @@ impl QueueManager for ConcurrentQueueManager {
                         while booker.remaining_seats() > 0 {
                             let tickets = simulate_booking(&mut booker);
                             if tickets.is_empty() {
-                                tail_fails = tail_fails.saturating_add(1);
-                                if tail_fails <= 2 {
-                                    std::hint::spin_loop();
-                                } else if tail_fails <= 6 {
-                                    thread::yield_now();
-                                } else {
-                                    thread::sleep(std::time::Duration::from_micros(30));
+                                // Solo frenamos si estamos en la cola final (pocas plazas restantes).
+                                // Durante la venta normal, un intento vacío se debe simplemente al
+                                // arrepentimiento probabilístico del comprador; el hilo debe atender
+                                // inmediatamente a la siguiente sesión sin pausas.
+                                if booker.remaining_seats() <= num_workers * 2 {
+                                    tail_fails = tail_fails.saturating_add(1);
+                                    if tail_fails <= 2 {
+                                        std::hint::spin_loop();
+                                    } else if tail_fails <= 6 {
+                                        thread::yield_now();
+                                    } else {
+                                        thread::sleep(std::time::Duration::from_micros(30));
+                                    }
                                 }
                             } else {
                                 tail_fails = 0;

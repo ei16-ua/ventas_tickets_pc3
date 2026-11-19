@@ -325,18 +325,23 @@ impl ConcurrentVenue {
                     let booked = s.booked.get();
                     let available = s.available.get();
                     let selected = s.capacity.saturating_sub(booked + available);
-                    // Construimos los seats directamente con el estado correcto,
-                    // sin crear primero todos como Available y luego sobreescribir.
-                    let seats = (1..=s.capacity)
-                        .map(|i| Seat {
-                            id: format!("{}-{}", s.code, i),
-                            state: if i <= booked {
-                                SeatState::Booked
-                            } else if i <= booked + selected {
-                                SeatState::Selected
-                            } else {
-                                SeatState::Available
-                            },
+                    // Reutilizamos los IDs precalculados para evitar miles de format!
+                    let seats = s
+                        .ids
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, id)| {
+                            let i = idx + 1;
+                            Seat {
+                                id: id.clone(),
+                                state: if i <= booked {
+                                    SeatState::Booked
+                                } else if i <= booked + selected {
+                                    SeatState::Selected
+                                } else {
+                                    SeatState::Available
+                                },
+                            }
                         })
                         .collect();
                     Sector {

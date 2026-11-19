@@ -407,7 +407,8 @@ impl Booker for ConcurrentBooker {
                 Ok(())
             }
             SectorConcurrente::Numerado(s) => {
-                let idxs = Self::indices(s, seat_ids)?;
+                let mut idxs = Self::indices(s, seat_ids)?;
+                idxs.sort_unstable();
                 cas::cambiar_todas(s, &idxs, SELECCIONADA, LIBRE)
                     .map_err(|i| format!("Seat {} is not selected", s.ids[i]))?;
                 s.available.0.fetch_add(idxs.len(), Ordering::AcqRel);
@@ -434,7 +435,8 @@ impl Booker for ConcurrentBooker {
         match self.sector(sector_code)? {
             SectorConcurrente::General(s) => Ok(self.book_general(s, seat_ids.len())),
             SectorConcurrente::Numerado(s) => {
-                let idxs = Self::indices(s, seat_ids)?;
+                let mut idxs = Self::indices(s, seat_ids)?;
+                idxs.sort_unstable();
                 match cas::cambiar_todas(s, &idxs, SELECCIONADA, VENDIDA) {
                     Ok(()) => {
                         s.booked.0.fetch_add(idxs.len(), Ordering::AcqRel);
