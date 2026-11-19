@@ -3,5 +3,9 @@ name = "tickets"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "main2"
+path = "src/main2.rs"
+
 [dependencies]
 rand = "0.9.2"

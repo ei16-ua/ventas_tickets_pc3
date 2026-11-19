@@ -254,14 +254,14 @@ impl ConcurrentBooker {
 
     /// Traduce los IDs de butaca a posiciones del vector de atómicos.
     fn indices(sector: &SectorNumerado, seat_ids: &[String]) -> Result<Vec<usize>, String> {
-        seat_ids
-            .iter()
-            .map(|id| {
-                sector
-                    .index_of(id)
-                    .ok_or_else(|| format!("Seat {} does not exist in sector {}", id, sector.code))
-            })
-            .collect()
+        let mut idxs = Vec::with_capacity(seat_ids.len());
+        for id in seat_ids {
+            let idx = sector
+                .index_of(id)
+                .ok_or_else(|| format!("Seat {} does not exist in sector {}", id, sector.code))?;
+            idxs.push(idx);
+        }
+        Ok(idxs)
     }
 
     // ----------------------- Admisión general -----------------------------
@@ -298,9 +298,8 @@ impl ConcurrentBooker {
                 .map(|i| format!("{}-{}", sector.code, i))
                 .collect()
         };
-        // fetch_sub seguro: sin CAS loop, simplemente bajamos selected en min(cur, n)
-        let cur_sel = sector.selected.0.load(Ordering::Relaxed);
-        sector.selected.0.fetch_sub(cur_sel.min(n), Ordering::AcqRel);
+        // Decremento atómico wait-free sin bucle CAS (evita contención en caché)
+        sector.selected.0.fetch_sub(n, Ordering::Relaxed);
         sector.booked.0.fetch_add(n, Ordering::AcqRel);
         // El total global se actualiza lo último: `remaining_seats()` nunca
         // llega a 0 antes de que la venta esté hecha de verdad.
@@ -326,14 +325,13 @@ impl Booker for ConcurrentBooker {
     }
 
     fn get_available_sectors(&self) -> Vec<String> {
-        // Relaxed basta: solo necesitamos saber si hay plazas aprox.,
-        // el CAS posterior garantiza la atomicidad real.
-        self.shared
-            .sectors
-            .iter()
-            .filter(|s| s.available_relaxed() > 0)
-            .map(|s| s.code().to_string())
-            .collect()
+        let mut available = Vec::with_capacity(self.shared.sectors.len());
+        for s in &self.shared.sectors {
+            if s.available_relaxed() > 0 {
+                available.push(s.code().to_string());
+            }
+        }
+        available
     }
 
     fn is_sector_numbered(&self, sector_code: &str) -> bool {
@@ -369,16 +367,17 @@ impl Booker for ConcurrentBooker {
                 } else {
                     0
                 };
-                s.seats
-                    .iter()
-                    .zip(&s.ids)
-                    .cycle()
-                    .skip(start)
-                    .take(s.capacity)
-                    .filter(|(estado, _)| estado.load(Ordering::Relaxed) == LIBRE)
-                    .map(|(_, id)| id.clone())
-                    .take(limit)
-                    .collect()
+                let mut available = Vec::with_capacity(limit);
+                // Recorrido directo por rebanadas con parada temprana inmediata
+                for i in (start..s.capacity).chain(0..start) {
+                    if s.seats[i].load(Ordering::Relaxed) == LIBRE {
+                        available.push(s.ids[i].clone());
+                        if available.len() == limit {
+                            break;
+                        }
+                    }
+                }
+                available
             }
             None => panic!("Unknown sector: '{sector_code}'"),
         }
@@ -387,7 +386,7 @@ impl Booker for ConcurrentBooker {
     fn remaining_seats(&self) -> usize {
         // Relaxed basta: solo se usa para la condición del while loop,
         // no necesita ser un valor exacto, solo "¿queda algo?"
-        self.shared.capacity - self.shared.total_booked.0.load(Ordering::Relaxed)
+        self.shared.capacity.saturating_sub(self.shared.total_booked.0.load(Ordering::Relaxed))
     }
 
     fn select_sector(&mut self, _sector_code: &str) {
@@ -402,10 +401,8 @@ impl Booker for ConcurrentBooker {
         match self.sector(sector_code)? {
             SectorConcurrente::General(s) => {
                 let n = seat_ids.len();
-                // Decrementamos selected de forma segura (sin pasar de 0)
-                // y restauramos available directamente: siempre devolvemos n plazas.
-                let cur_sel = s.selected.0.load(Ordering::Relaxed);
-                s.selected.0.fetch_sub(cur_sel.min(n), Ordering::AcqRel);
+                // Decremento atómico wait-free sin bucle CAS
+                s.selected.0.fetch_sub(n, Ordering::Relaxed);
                 s.available.0.fetch_add(n, Ordering::AcqRel);
                 Ok(())
             }

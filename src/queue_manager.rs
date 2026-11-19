@@ -39,25 +39,29 @@ impl QueueManager for SequentialQueueManager {
 /// Como cada comprador pasa la mayor parte del tiempo simulando esperas
 /// (`thread::sleep`), tener múltiples hilos por núcleo permite solapar
 /// esos tiempos muertos sin saturar la CPU.
-/// Con TIME_MULTIPLIER=100000 los sleeps son ~150µs–6ms reales:
-/// 6 hilos/núcleo mantiene el core ocupado incluso si varios duermen a la vez.
 #[allow(dead_code)]
-const THREADS_PER_CORE: usize = 6;
+const THREADS_PER_CORE: usize = 8;
 
 /// Calcula dinámicamente el número óptimo de hilos según la máquina donde se ejecute:
 /// - Se adapta automáticamente a los núcleos reales de la máquina (portátil, uni, PC potente).
-/// - Con 2-3 hilos por núcleo se solapan los tiempos muertos sin sobrecargar el planificador del SO.
+/// - En recintos pequeños se limita para evitar contención innecesaria.
+/// - Nunca entra en pánico (evita clamp(min, max) cuando capacidad < núcleos).
 #[allow(dead_code)]
 fn n_threads(capacity: usize) -> usize {
     let cores = thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
 
-    let optimal_threads = cores * THREADS_PER_CORE;
+    // Para recintos pequeños no tiene sentido tener cientos de hilos compitiendo
+    let target = if capacity <= 50 {
+        capacity.max(1)
+    } else if capacity <= 500 {
+        (cores * 2).min(capacity)
+    } else {
+        (cores * THREADS_PER_CORE).min(128).min(capacity)
+    };
 
-    // Al menos tantos hilos como núcleos tenga la máquina,
-    // y nunca más hilos que el aforo total a vender.
-    optimal_threads.clamp(cores, capacity.max(1))
+    target.max(1)
 }
 
 /// Implementación concurrente: un grupo de hilos que atienden sesiones de
@@ -75,37 +79,31 @@ impl QueueManager for ConcurrentQueueManager {
     }
 
     fn run(&mut self) -> Vec<String> {
-        let mut sold_tickets = Vec::with_capacity(self.booker.get_total_capacity());
+        let total_cap = self.booker.get_total_capacity();
+        let num_workers = n_threads(total_cap);
+        let mut sold_tickets = Vec::with_capacity(total_cap);
+        let per_worker_cap = (total_cap / num_workers).max(64);
 
         // `thread::scope` garantiza que todos los hilos han terminado al salir.
         thread::scope(|scope| {
-            let workers: Vec<_> = (0..n_threads(self.booker.get_total_capacity()))
+            let workers: Vec<_> = (0..num_workers)
                 .map(|_| {
                     // Cada hilo recibe su propio clon del booker (comparten el Arc).
                     let mut booker = self.booker.clone();
                     scope.spawn(move || {
                         // Tickets vendidos por este hilo: Vec local, sin cerrojo.
-                        // Preasignamos capacidad proporcional para evitar reallocaciones.
-                        let mut mis_tickets = Vec::with_capacity(
-                            (booker.get_total_capacity() / n_threads(booker.get_total_capacity())).max(64)
-                        );
+                        let mut mis_tickets = Vec::with_capacity(per_worker_cap);
                         let mut tail_fails: u32 = 0;
                         while booker.remaining_seats() > 0 {
                             let tickets = simulate_booking(&mut booker);
                             if tickets.is_empty() {
-                                // Solo frenamos si todas las plazas restantes están
-                                // temporalmente retenidas por otros hilos (aforo libre = 0).
-                                if booker.get_total_available_seats() == 0 {
-                                    tail_fails = tail_fails.saturating_add(1);
-                                    if tail_fails <= 2 {
-                                        std::hint::spin_loop();
-                                    } else if tail_fails <= 6 {
-                                        thread::yield_now();
-                                    } else {
-                                        thread::sleep(std::time::Duration::from_micros(50));
-                                    }
+                                tail_fails = tail_fails.saturating_add(1);
+                                if tail_fails <= 2 {
+                                    std::hint::spin_loop();
+                                } else if tail_fails <= 6 {
+                                    thread::yield_now();
                                 } else {
-                                    tail_fails = 0;
+                                    thread::sleep(std::time::Duration::from_micros(30));
                                 }
                             } else {
                                 tail_fails = 0;

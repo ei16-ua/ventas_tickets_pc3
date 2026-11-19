@@ -1,0 +1,5 @@
+# Artefactos generados por Rust/Cargo
+/target/
+
+# Paquete comprimido de entrega
+/p3.tgz

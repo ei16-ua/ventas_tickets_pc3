@@ -149,6 +149,7 @@ impl Contador {
     }
 
     /// Lectura relajada (para observaciones no críticas en el hot path).
+    #[allow(dead_code)]
     #[inline(always)]
     pub fn get_relaxed(&self) -> usize {
         self.0.load(Ordering::Relaxed)
