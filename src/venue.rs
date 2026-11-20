@@ -1,5 +1,5 @@
 use std::fmt;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU8, AtomicUsize, Ordering};
 
 /// Modelo de un recinto (*Venue*), compuesto por un nombre y múltiples sectores.
 #[derive(Clone)]
@@ -52,10 +52,6 @@ impl fmt::Display for Venue {
 }
 
 /// Representa un sector dentro del recinto.
-///
-/// Cada sector tiene un nombre descriptivo, un código corto (p. ej. `"ST"`, `"S1"`),
-/// un vector de asientos (`Seat`), una capacidad total y una bandera que indica
-/// si los asientos son numerados (`is_numbered: true`) o de admisión general (`false`).
 #[derive(Clone)]
 pub struct Sector {
     pub name: String,
@@ -68,11 +64,8 @@ pub struct Sector {
 /// Estado en el que se encuentra un asiento o localidad.
 #[derive(PartialEq, Clone)]
 pub enum SeatState {
-    /// Asiento libre, disponible para selección.
     Available,
-    /// Asiento bloqueado provisionalmente por una sesión de compra.
     Selected,
-    /// Asiento vendido definitivamente.
     Booked,
 }
 
@@ -102,28 +95,21 @@ impl Sector {
         }
     }
 
-    /// Devuelve referencias a todos los asientos que se encuentran actualmente disponibles.
     pub fn get_available_seats(&self) -> Vec<&Seat> {
         self.seats.iter().filter(|s| s.state == SeatState::Available).collect()
     }
 
-    /// Devuelve el número de asientos actualmente en estado `Available`.
     pub fn n_available_seats(&self) -> usize {
         self.seats.iter().filter(|s| s.state == SeatState::Available).count()
     }
 
-    /// Devuelve el número de asientos actualmente en estado `Booked`.
     pub fn n_booked_seats(&self) -> usize {
         self.seats.iter().filter(|s| s.state == SeatState::Booked).count()
     }
 }
 
 // ===========================================================================
-//  MODELO CONCURRENTE
-//  Todo el estado que cambia durante la venta está en atómicos, así que se
-//  puede compartir entre hilos con un `Arc` sin ningún `Mutex`.
-//  El `Venue` de arriba se sigue usando como "foto": se recibe al principio
-//  (`from_venue`) y se reconstruye al final (`snapshot`).
+//  MODELO CONCURRENTE (sin cerrojos)
 // ===========================================================================
 
 /// Estados de una butaca numerada guardados en un `AtomicU8`.
@@ -131,9 +117,7 @@ pub const LIBRE: u8 = 0;
 pub const SELECCIONADA: u8 = 1;
 pub const VENDIDA: u8 = 2;
 
-/// Contador atómico alineado a 64 bytes (una línea de caché).
-/// Así dos contadores distintos nunca comparten línea y no hay
-/// falso compartido entre sectores.
+/// Contador atómico sin signo alineado a 64 bytes para evitar false sharing.
 #[repr(align(64))]
 pub struct Contador(pub AtomicUsize);
 
@@ -143,12 +127,11 @@ impl Contador {
         Contador(AtomicUsize::new(valor))
     }
 
-    /// Lectura del valor actual (con barrera Acquire).
+    #[inline(always)]
     pub fn get(&self) -> usize {
         self.0.load(Ordering::Acquire)
     }
 
-    /// Lectura relajada (para observaciones no críticas en el hot path).
     #[allow(dead_code)]
     #[inline(always)]
     pub fn get_relaxed(&self) -> usize {
@@ -156,22 +139,48 @@ impl Contador {
     }
 }
 
-/// Sector de admisión general (sin butaca concreta): solo importa cuántas
-/// plazas quedan, así que basta con contadores.
+/// Contador atómico con signo alineado a 64 bytes.
+/// Evita underflow transitorio cuando un hilo decrementa antes de que otro
+/// complete el incremento tras liberar asientos con CAS.
+#[repr(align(64))]
+pub struct ContadorIsize(pub AtomicIsize);
+
+impl ContadorIsize {
+    #[allow(dead_code)]
+    pub fn new(valor: usize) -> Self {
+        ContadorIsize(AtomicIsize::new(valor as isize))
+    }
+
+    #[inline(always)]
+    pub fn get(&self) -> usize {
+        self.0.load(Ordering::Acquire).max(0) as usize
+    }
+
+    #[inline(always)]
+    pub fn get_relaxed(&self) -> usize {
+        self.0.load(Ordering::Relaxed).max(0) as usize
+    }
+
+    #[inline(always)]
+    pub fn add(&self, n: usize) {
+        self.0.fetch_add(n as isize, Ordering::AcqRel);
+    }
+
+    #[inline(always)]
+    pub fn sub(&self, n: usize) {
+        self.0.fetch_sub(n as isize, Ordering::AcqRel);
+    }
+}
+
+/// Sector de admisión general: gestionado mediante contadores atómicos.
 #[allow(dead_code)]
 pub struct SectorGeneral {
     pub name: String,
     pub code: String,
     pub capacity: usize,
-    /// Plazas libres (ni seleccionadas ni vendidas).
     pub available: Contador,
-    /// Plazas bloqueadas provisionalmente por compradores.
-    pub selected: Contador,
-    /// Plazas vendidas definitivamente.
     pub booked: Contador,
-    /// Siguiente número de ticket a emitir (genera IDs únicos "ST-1", "ST-2"...).
     pub next_ticket: Contador,
-    /// Identificadores de tickets tomados del Venue original (evita allocaciones de strings).
     pub ids: Vec<String>,
 }
 
@@ -181,29 +190,21 @@ pub struct SectorNumerado {
     pub name: String,
     pub code: String,
     pub capacity: usize,
-    /// IDs de las butacas ("S3-1", "S3-2"...). Solo lectura: no necesita sincronización.
     pub ids: Vec<String>,
-    /// Estado de cada butaca: LIBRE, SELECCIONADA o VENDIDA.
     pub seats: Vec<AtomicU8>,
-    pub available: Contador,
-    pub booked: Contador,
+    pub available: ContadorIsize,
 }
 
 #[allow(dead_code)]
 impl SectorNumerado {
-    /// Traduce un ID de butaca ("S3-17") a su posición en `seats` (16).
-    /// Fast path O(1): lee el número tras el último '-'. Los IDs siempre
-    /// siguen el formato "CODE-N" generado por Sector::new, así que
-    /// basta verificar que el índice esté en rango.
+    /// Traduce un ID de butaca ("S3-17") a su posición en `seats` (16),
+    /// verificando que pertenezca a este sector y esté en rango.
     #[inline(always)]
     pub fn index_of(&self, seat_id: &str) -> Option<usize> {
-        let numero: usize = seat_id.rsplit('-').next()?.parse().ok()?;
+        let resto = seat_id.strip_prefix(&self.code)?.strip_prefix('-')?;
+        let numero: usize = resto.parse().ok()?;
         let idx = numero.checked_sub(1)?;
-        if idx < self.capacity {
-            Some(idx)
-        } else {
-            None
-        }
+        (idx < self.capacity).then_some(idx)
     }
 }
 
@@ -233,11 +234,10 @@ impl SectorConcurrente {
         }
     }
 
-    /// Lectura relajada de plazas disponibles (solo para filtrados de observación).
     pub fn available_relaxed(&self) -> usize {
         match self {
-            SectorConcurrente::General(s) => s.available.0.load(Ordering::Relaxed),
-            SectorConcurrente::Numerado(s) => s.available.0.load(Ordering::Relaxed),
+            SectorConcurrente::General(s) => s.available.get_relaxed(),
+            SectorConcurrente::Numerado(s) => s.available.get_relaxed(),
         }
     }
 }
@@ -248,13 +248,11 @@ pub struct ConcurrentVenue {
     pub name: String,
     pub sectors: Vec<SectorConcurrente>,
     pub capacity: usize,
-    /// Total de entradas vendidas en todo el recinto.
     pub total_booked: Contador,
 }
 
 #[allow(dead_code)]
 impl ConcurrentVenue {
-    /// Construye el estado concurrente a partir del `Venue` inicial.
     pub fn from_venue(venue: &Venue) -> Self {
         let mut sectors = Vec::with_capacity(venue.sectors.len());
         let mut total_booked = 0;
@@ -282,8 +280,7 @@ impl ConcurrentVenue {
                     capacity: s.capacity,
                     ids: s.seats.iter().map(|seat| seat.id.clone()).collect(),
                     seats,
-                    available: Contador::new(available),
-                    booked: Contador::new(booked),
+                    available: ContadorIsize::new(available),
                 }));
             } else {
                 sectors.push(SectorConcurrente::General(SectorGeneral {
@@ -291,7 +288,6 @@ impl ConcurrentVenue {
                     code: s.code.clone(),
                     capacity: s.capacity,
                     available: Contador::new(available),
-                    selected: Contador::new(0),
                     booked: Contador::new(booked),
                     next_ticket: Contador::new(booked),
                     ids: s.seats.iter().map(|seat| seat.id.clone()).collect(),
@@ -307,9 +303,6 @@ impl ConcurrentVenue {
         }
     }
 
-    /// Busca un sector por su código.
-    /// Con ≤30 sectores la búsqueda lineal es más rápida que el HashMap
-    /// por mejor localidad de caché (no hay indirección de hash ni posible miss).
     #[inline(always)]
     pub fn sector(&self, code: &str) -> Option<&SectorConcurrente> {
         self.sectors.iter().find(|s| s.code() == code)
@@ -325,7 +318,6 @@ impl ConcurrentVenue {
                     let booked = s.booked.get();
                     let available = s.available.get();
                     let selected = s.capacity.saturating_sub(booked + available);
-                    // Reutilizamos los IDs precalculados para evitar miles de format!
                     let seats = s
                         .ids
                         .iter()

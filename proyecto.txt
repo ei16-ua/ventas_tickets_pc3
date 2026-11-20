@@ -1,0 +1,1447 @@
+==> Cargo.toml <==
+[package]
+name = "tickets"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "main2"
+path = "src/main2.rs"
+
+[dependencies]
+rand = "0.9.2"
+==> enunciado.md <==
+# Práctica 3: Venta de entradas concurrente en Rust
+
+**Fecha límite de entrega:** 30 de noviembre de 2026  
+**Lenguaje de trabajo:** Rust (`std::sync`, `std::thread`, atomics, mutexes)  
+**Código de inicio:** 📥 **[p3.tgz](/p3.tgz)**
+
+---
+
+## 1. Objetivos de la práctica
+
+1. **Diseñar e implementar una arquitectura de ticketing concurrente en Rust:** Transformar un sistema secuencial de venta de entradas en una solución multihilo de alto rendimiento capaz de atender ráfagas masivas de compradores concurrentes sobre recintos con diferentes sectores y capacidades.
+2. **Garantizar la consistencia estricta (*Safety*):** Eliminar condiciones de carrera y asegurar la invariante de negocio fundamental: cero billetes duplicados, 100% de aforo vendido y ausencia de reservas huérfanas o perdidas.
+3. **Minimizar la contención y maximizar el rendimiento (*Throughput*):** Identificar cuellos de botella generados por cerrojos globales de grano grueso y diseñar estrategias de sincronización eficientes en memoria compartida.
+4. **Prevenir interbloqueos (*Deadlocks*) y pérdidas de vivacidad (*Liveness*):** Coordinar el ciclo de vida de los hilos compradores y la cola de espera para asegurar que el sistema progrese de forma continua y finalice limpiamente.
+
+---
+
+## 2. El problema: venta masiva de entradas y alta contención
+
+Imagina el lanzamiento de entradas para un gran concierto o evento: miles de usuarios acceden simultáneamente para conseguir localidades en diferentes zonas del recinto (pistas de pie de admisión general, gradas con asientos numerados, etc.).
+
+El problema es **intrínsecamente concurrente**: múltiples compradores consultan la disponibilidad, seleccionan asientos y confirman la compra al mismo tiempo. Sin los mecanismos de sincronización adecuados, aparecen graves problemas de concurrencia:
+- **Condiciones de carrera (*Race Conditions*):** Venta duplicada del mismo asiento a dos usuarios distintos.
+- **Inconsistencias y pérdidas de plazas:** Bloqueos temporales que nunca se liberan o entradas que quedan huérfanas.
+- **Cuellos de botella por grano grueso:** Si se utiliza un único cerrojo global para todo el recinto, los hilos se serializan y el rendimiento colapsa.
+
+> **Desacoplamiento Frontend-Backend:**  
+> El sistema modela una arquitectura web cliente-servidor:
+> * **Frontend / Cliente (`simulation.rs`):** Modela las sesiones concurrentes de los usuarios compradores (consulta de sectores, selección de butacas, confirmación o arrepentimiento). Interactúa con el backend exclusivamente mediante cadenas de texto (`String` / `&[String]`), simulando una API web.
+> * **Backend / Motor de Reservas (`booking.rs`):** Implementa la lógica de disponibilidad, reserva provisional y venta definitiva. Debe garantizar la consistencia del estado del recinto en todo momento bajo acceso multihilo.
+
+---
+
+## 3. Código base de la práctica
+
+El paquete inicial contiene la estructura del proyecto con la implementación secuencial de partida:
+* `main.rs`: Punto de entrada de la aplicación (**no modificable**). Carga la configuración, inicializa el recinto y ejecuta la simulación.
+* `config.rs`: Parámetros de ejecución y utilidades de configuración (**no modificable**).
+* `simulation.rs`: Flujo de compra por sesión (**no modificable**). Orquesta el proceso de interacción de cada comprador.
+* `booking.rs`: Define el **trait `Booker`** (la interfaz que debe cumplir el motor de reservas) y la implementación secuencial de referencia (`SequentialBooker`).
+* `venue.rs`: Modelo de datos del recinto, sectores y asientos.
+* `queue_manager.rs`: Define el **trait `QueueManager`** y el esqueleto para orquestar los hilos en `ConcurrentQueueManager`.
+* `algorithm_name.txt`: Fichero de texto donde debes indicar el nombre o identificador de tu solución.
+
+### Compilación y ejecución:
+```bash
+# 1. Compilar en modo release (imprescindible para medir rendimiento real)
+cargo build --release
+
+# 2. Ejecutar sobre el recinto de prueba incluido
+cargo run --release
+```
+
+El código de partida incluye un recinto de ejemplo con sectores de admisión general y sectores numerados para que puedas probar tu solución en local. Durante la evaluación automática se utilizarán distintas configuraciones y tamaños de recinto para medir la robustez y escalabilidad de tu algoritmo.
+
+---
+
+## 4. Descripción del trabajo a realizar
+
+Tu labor consiste en transformar el sistema secuencial en una **solución concurrente de alto rendimiento**, manteniendo la corrección estricta y cumpliendo el contrato de la API:
+
+### 4.1 Implementar `ConcurrentQueueManager` (en `queue_manager.rs`)
+- Debe implementar el trait `QueueManager`.
+- Coordinar un conjunto de hilos *workers* (o un pool de tareas) para procesar concurrentemente las sesiones de compra de los usuarios que llegan a la cola.
+- Recolectar de forma segura todos los identificadores de tickets vendidos por las distintas sesiones y devolverlos en el método:
+  ```rust
+  fn run(&mut self) -> Vec<String>
+  ```
+
+### 4.2 Implementar un `Booker` concurrente (en `booking.rs` o módulos adicionales)
+- Debe implementar fielmente el trait `Booker`.
+- Diseñar la sincronización interna para soportar acceso concurrente multihilo sin condiciones de carrera y minimizando la contención entre hilos.
+- Puedes modificar `venue.rs` o añadir nuevos módulos auxiliares según el diseño de sincronización que elijas.
+
+### 4.3 Flujo del proceso de compra por sesión (`simulation.rs`)
+El módulo `simulation.rs` orquesta la simulación del comportamiento de cada comprador a través de los métodos de tu `Booker`:
+1. **Consulta de sectores disponibles:** Llama a `get_available_sectors()` para conocer qué zonas disponen de aforo.
+2. **Selección de sector:** El comprador elige un sector según sus preferencias e invoca `select_sector(&sector)`.
+3. **Consulta de localidades disponibles:** Invoca `get_available_seats(&sector)` para obtener la lista de identificadores disponibles en dicho sector.
+4. **Reserva provisional:** El comprador elige aleatoriamente $N$ localidades e intenta bloquearlas temporalmente llamando a `select_seats(&sector, &selected_seats)`.
+5. **Decisión del usuario:**
+   - Si el usuario **cambia de opinión** (50% de probabilidad), libera las localidades provisionales mediante `deselect_seats(&sector, &selected_seats)` y prueba con otro sector.
+   - Si el usuario **confirma la compra**, invoca `book_seats(&sector, &selected_seats)`.
+6. **Checkout definitivo:**
+   - La llamada a `book_seats` confirma definitivamente la reserva y **debe devolver un `Result<Vec<String>, String>` con los identificadores únicos definitivos de las entradas vendidas**.
+   - Si la compra no puede completarse (por ejemplo, porque la reserva provisional expiró o hubo un conflicto entre compradores), el usuario sufre una penalización de reintento y pasa a su siguiente preferencia.
+
+---
+
+## 5. Requisitos de la solución y restricciones
+
+1. **Restricciones de modificación de código:**
+   - **NO se pueden modificar:** `main.rs`, `simulation.rs` ni `config.rs`. Durante la evaluación automática se utilizarán las versiones oficiales de estos archivos.
+   - **Puedes modificar y ampliar:** `booking.rs`, `queue_manager.rs`, `venue.rs` y crear los ficheros o submódulos auxiliares que requiera tu diseño.
+
+2. **Prohibición de dependencias adicionales:**
+   - **No se permite el uso de dependencias o *crates* externos adicionales.** Toda la sincronización y concurrencia debe implementarse haciendo uso exclusivo de la biblioteca estándar de Rust (`std::sync`, `std::thread`, atomics, mutexes, etc.). Durante la corrección automática se utilizará el entorno base oficial, por lo que cualquier dependencia externa introducida provocará un fallo de compilación.
+
+3. **Condiciones de correctitud:**
+   - **Cero ventas duplicadas:** Cada entrada vendida debe ser única.
+   - **Venta completa:** Se debe vender exactamente el 100% de la capacidad del recinto.
+   - **Ausencia de interbloqueos (*deadlocks*):** El programa debe finalizar de forma limpia y determinista dentro del tiempo establecido.
+
+4. **Fichero de identificación del algoritmo:**
+   - Debes incluir un fichero llamado `algorithm_name.txt` que contenga una única línea con el nombre que identifique tu solución o algoritmo.
+
+---
+
+## 6. Criterios de evaluación y entrega
+
+La evaluación se realizará de forma **100% automática** sobre una batería de recintos de prueba con distintas configuraciones y niveles de concurrencia.
+
+### Correctitud (Requisito indispensable)
+En cada escenario de prueba se comprobarán estrictamente los siguientes requisitos:
+- **Cero ventas duplicadas:** Ningún identificador de ticket puede haberse vendido más de una vez ($\text{len}(HashSet) == \text{len}(sold\_tickets)$).
+- **Venta completa:** Se vende exactamente el 100% de la capacidad del recinto, sin localidades huérfanas ni bloqueos pendientes.
+- **Ausencia de interbloqueos (*deadlocks*):** La ejecución debe finalizar limpiamente dentro del tiempo límite establecido.
+- **Cumplimiento del contrato:** No se han alterado los ficheros protegidos (`main.rs`, `simulation.rs`, `config.rs`).
+
+> **Importante:** Cualquier incumplimiento de las condiciones de correctitud en un escenario invalida la puntuación de dicho escenario.
+
+### Rendimiento concurrente
+Entre todas las entregas que superen los requisitos de correctitud en un escenario, la calificación se determinará a partir del **tiempo de ejecución y el rendimiento (*throughput*) obtenido**:
+- Las implementaciones con menor tiempo de ejecución y menor contención obtendrán la máxima calificación.
+- El uso de la solución secuencial básica o de soluciones concurrentes con serialización total (bloqueos globales de grano grueso) penalizará fuertemente la calificación, ya que el objetivo fundamental de la práctica es el diseño de algoritmos concurrentes eficientes.
+
+### Formato y entrega
+- La entrega se realiza a través de la plataforma [pracdlsi](https://pracdlsi.dlsi.ua.es/index.cgi).
+- **No es necesario entregar `Cargo.toml`.**
+- El archivo comprimido `p3.tgz` debe contener tu código fuente y tu fichero de identificación:
+  - `booking.rs`
+  - `queue_manager.rs`
+  - `venue.rs` (y ficheros auxiliares propios, si los has creado)
+  - `algorithm_name.txt`
+- Para generar la entrega, coloca estos ficheros dentro de un directorio llamado `p3` y comprímelo mediante el terminal:
+  ```bash
+  tar cfz p3.tgz p3
+  ```
+- Puedes entregar tantas veces como desees antes de la fecha límite; el sistema evaluará únicamente la última entrega registrada.
+
+==> algorithm_name.txt <==
+MiAlgoritmo
+https://aicassindra.com/blogs/threading/threading_lock_free.html
+https://doc.rust-lang.org/std/sync/atomic/
+https://dev.to/axelncho/using-lmax-disruptor-to-build-a-high-performance-in-memory-event-broker-in-java-6i
+https://www.stanza.dev/courses/rust-concurrency/atomics/rust-concurrency-cas-patterns
+https://github.com/joaquinbejar/OrderBook-rs/blob/main/src/orderbook/book_change_event.rs
+LockFree-OCC-CAS
+
+==> src/main.rs <==
+mod venue;
+mod booking;
+mod simulation;
+mod config;
+mod queue_manager;
+
+use venue::{Sector, Venue};
+use queue_manager::{ConcurrentQueueManager, QueueManager};
+
+pub fn initialize_venue() -> Venue {
+    let mut sectors: Vec<Sector> = vec![
+        Sector::new("Standing", "ST", config::STANDING_CAPACITY, false),
+        Sector::new("Golden Circle", "GC", config::GOLDEN_CIRCLE_CAPACITY, false),
+    ];
+
+    for i in 0..config::N_SECTORS {
+        sectors.push(Sector::new(
+            &format!("Seated {}", i + 1),
+            &format!("S{}", i + 1),
+            config::SEATED_SECTOR_CAPACITY,
+            true,
+        ));
+    }
+
+    Venue {
+        name: String::from("Recinto de Ejemplo"),
+        sectors,
+    }
+}
+
+fn main() {
+    let time_start = std::time::Instant::now();
+
+    let venue = initialize_venue();
+
+    let mut queue_manager = ConcurrentQueueManager::new(venue);
+    let _sold_tickets = queue_manager.run();
+
+    let time_end = std::time::Instant::now();
+    let duration = time_end.duration_since(time_start);
+    let total_seconds = duration.as_secs_f32() * config::TIME_MULTIPLIER;
+    let _hours = (total_seconds / 3600.0).floor();
+    let _minutes = ((total_seconds % 3600.0) / 60.0).floor();
+    let _seconds = (total_seconds % 60.0).floor();
+    println!("All seats booked in {:.0}:{:02.0}:{:02.0}", _hours, _minutes, _seconds);
+
+    let _hours_float = total_seconds / 3600.0;
+    if _hours_float > 0.0 {
+        println!(
+            "Throughput: {:.2} tickets/hour",
+            (queue_manager.get_venue().total_capacity() as f32) / _hours_float
+        );
+    }
+    println!("Total tickets sold: {}", _sold_tickets.len());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn test_sequential_booking_correctness() {
+        let sectors = vec![
+            Sector::new("Standing", "ST", 50, false),
+            Sector::new("Seated 1", "S1", 30, true),
+            Sector::new("Seated 2", "S2", 20, true),
+        ];
+        let venue = Venue {
+            name: "Small Test Arena".to_string(),
+            sectors,
+        };
+        let expected_capacity = venue.total_capacity();
+
+        let mut queue_manager = ConcurrentQueueManager::new(venue);
+        let sold_tickets = queue_manager.run();
+
+        // 1. All tickets must be sold
+        assert_eq!(
+            sold_tickets.len(),
+            expected_capacity,
+            "Total sold tickets must match venue capacity"
+        );
+
+        // 2. No duplicate ticket IDs
+        let mut unique_set = HashSet::new();
+        for id in &sold_tickets {
+            assert!(
+                unique_set.insert(id.clone()),
+                "Duplicate ticket ID found: {}",
+                id
+            );
+        }
+
+        // 3. Venue state consistency
+        let final_venue = queue_manager.get_venue();
+        assert_eq!(final_venue.total_booked_seats(), expected_capacity);
+        assert_eq!(final_venue.total_available_seats(), 0);
+    }
+}
+
+==> src/config.rs <==
+/// Parámetros de configuración de la simulación y del recinto de ejemplo.
+
+/// Número mínimo de entradas que un comprador intenta adquirir en una sesión.
+pub static MIN_TICKETS: usize = 1;
+
+/// Número máximo de entradas que un comprador intenta adquirir en una sesión.
+pub static MAX_TICKETS: usize = 6;
+
+/// Factor multiplicador temporal para acelerar los retardos de simulación en CPU.
+pub static TIME_MULTIPLIER: f32 = 100000.0;
+
+/// Número de sectores numerados en el recinto de ejemplo.
+pub static N_SECTORS: usize = 25;
+
+/// Capacidad de cada sector numerado en el recinto de ejemplo.
+pub static SEATED_SECTOR_CAPACITY: usize = 300;
+
+/// Capacidad del sector Golden Circle en el recinto de ejemplo.
+pub static GOLDEN_CIRCLE_CAPACITY: usize = 2500;
+
+/// Capacidad del sector Pista General (Standing) en el recinto de ejemplo.
+pub static STANDING_CAPACITY: usize = 12500;
+
+==> src/simulation.rs <==
+use rand::{random_bool, seq::{IndexedRandom, SliceRandom}, Rng};
+use crate::booking::Booker;
+use crate::config;
+
+/// Simula un retardo temporal aleatorio escalado por `TIME_MULTIPLIER`.
+///
+/// Modela el tiempo de procesamiento o decisión humana del usuario sin saturar la CPU
+/// mediante una pausa con `std::thread::sleep`.
+pub fn random_time_delay(min_seconds: usize, max_seconds: usize) {
+    let delay_secs = rand::rng().random_range(min_seconds..max_seconds) as f32 / config::TIME_MULTIPLIER;
+    std::thread::sleep(std::time::Duration::from_secs_f32(delay_secs));
+}
+
+/// Orquesta el flujo de interacción de una sesión de compra individual contra un `Booker`.
+///
+/// Modela el comportamiento del frontend/cliente web:
+/// 1. Consulta los sectores disponibles y baraja aleatoriamente el orden de preferencia.
+/// 2. Selecciona un sector o pasa al siguiente según decisión probabilística.
+/// 3. Consulta las localidades disponibles en dicho sector.
+/// 4. Intenta una reserva provisional (`select_seats`) para $N$ localidades aleatorias.
+/// 5. Toma una decisión: 50% cambia de opinión y cancela (`deselect_seats`), o 50% confirma la compra.
+/// 6. Checkout: invoca `book_seats`. Si se consolida con éxito, devuelve las entradas vendidas.
+///    Si falla, sufre una penalización de retardo y prueba con el siguiente sector de su lista.
+pub fn simulate_booking(booker: &mut dyn Booker) -> Vec<String> {
+    let n_tickets = rand::rng().random_range(config::MIN_TICKETS..=config::MAX_TICKETS);
+    let mut available_sectors = booker.get_available_sectors();
+    available_sectors.shuffle(&mut rand::rng());
+
+    for sector in available_sectors {
+        if random_bool(0.5) {
+            // El usuario decide descartar este sector y mirar otro
+            random_time_delay(15, 20);
+            continue;
+        }
+
+        random_time_delay(20, 45);
+        booker.select_sector(&sector);
+
+        random_time_delay(25, 150);
+        let available_seats = booker.get_available_seats(&sector);
+
+        if n_tickets > available_seats.len() {
+            // Aforo insuficiente en este sector para las entradas deseadas
+            booker.unselect_sector(&sector);
+            continue;
+        }
+        random_time_delay(25, 250);
+
+        // Selección provisional de N localidades
+        let selected_seats: Vec<String> = available_seats
+            .choose_multiple(&mut rand::rng(), n_tickets)
+            .cloned()
+            .collect();
+        let Ok(()) = booker.select_seats(&sector, &selected_seats) else {
+            booker.unselect_sector(&sector);
+            continue; // La reserva provisional falló por conflicto, prueba con otro sector
+        };
+
+        random_time_delay(15, 250);
+
+        if random_bool(0.5) {
+            // El usuario cambia de opinión y cancela la reserva provisional
+            booker.unselect_sector(&sector);
+            let _ = booker.deselect_seats(&sector, &selected_seats);
+            continue;
+        } else {
+            // El usuario confirma la compra
+            booker.unselect_sector(&sector);
+            random_time_delay(20, 100);
+            let Ok(booked_seats) = booker.book_seats(&sector, &selected_seats) else {
+                // La confirmación definitiva falló; penalización y reintento con otra preferencia
+                random_time_delay(120, 600);
+                continue;
+            };
+            return booked_seats;
+        }
+    }
+    Vec::new()
+}
+==> src/queue_manager.rs <==
+use crate::venue::Venue;
+use std::thread;
+
+use crate::booking::{Booker, ConcurrentBooker};
+use crate::simulation::simulate_booking;
+
+/// Trait que define las operaciones del gestor de colas.
+pub trait QueueManager {
+    fn new(venue: Venue) -> Self;
+    fn run(&mut self) -> Vec<String>;
+    fn get_venue(&self) -> Venue;
+}
+
+/// Gestor de colas que delega directamente en la implementación concurrente.
+/// Permite que cualquier punto de entrada oficial (incluido `main.rs`) ejecute
+/// la solución multihilo optimizada sin necesidad de alterar archivos protegidos.
+#[allow(dead_code)]
+pub struct SequentialQueueManager {
+    inner: ConcurrentQueueManager,
+}
+
+impl QueueManager for SequentialQueueManager {
+    fn new(venue: Venue) -> Self {
+        SequentialQueueManager {
+            inner: ConcurrentQueueManager::new(venue),
+        }
+    }
+
+    fn run(&mut self) -> Vec<String> {
+        self.inner.run()
+    }
+
+    fn get_venue(&self) -> Venue {
+        self.inner.get_venue()
+    }
+}
+
+/// Multiplicador de hilos por núcleo lógico detectado.
+/// Como cada comprador pasa la mayor parte del tiempo simulando esperas
+/// (`thread::sleep`), tener múltiples hilos por núcleo permite solapar
+/// esos tiempos muertos sin saturar la CPU.
+#[allow(dead_code)]
+const THREADS_PER_CORE: usize = 8;
+
+/// Calcula dinámicamente el número óptimo de hilos según la máquina donde se ejecute:
+/// - Se adapta automáticamente a los núcleos reales de la máquina (portátil, uni, PC potente).
+/// - En recintos pequeños se limita para evitar contención innecesaria.
+/// - Nunca entra en pánico (evita clamp(min, max) cuando capacidad < núcleos).
+#[allow(dead_code)]
+fn n_threads(capacity: usize) -> usize {
+    let cores = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+
+    // Para recintos pequeños no tiene sentido tener cientos de hilos compitiendo
+    let target = if capacity <= 50 {
+        capacity.max(1)
+    } else if capacity <= 500 {
+        (cores * 2).min(capacity)
+    } else {
+        (cores * THREADS_PER_CORE).min(128).min(capacity)
+    };
+
+    target.max(1)
+}
+
+/// Implementación concurrente: un grupo de hilos que atienden sesiones de
+/// compra en paralelo hasta agotar el aforo.
+#[allow(dead_code)]
+pub struct ConcurrentQueueManager {
+    booker: ConcurrentBooker,
+}
+
+impl QueueManager for ConcurrentQueueManager {
+    fn new(venue: Venue) -> Self {
+        ConcurrentQueueManager {
+            booker: ConcurrentBooker::new(venue),
+        }
+    }
+
+    fn run(&mut self) -> Vec<String> {
+        let total_cap = self.booker.get_total_capacity();
+        let num_workers = n_threads(total_cap);
+        let mut sold_tickets = Vec::with_capacity(total_cap);
+        let per_worker_cap = (total_cap / num_workers).max(64);
+
+        // `thread::scope` garantiza que todos los hilos han terminado al salir.
+        thread::scope(|scope| {
+            let workers: Vec<_> = (0..num_workers)
+                .map(|_| {
+                    // Cada hilo recibe su propio clon del booker (comparten el Arc).
+                    let mut booker = self.booker.clone();
+                    scope.spawn(move || {
+                        // Tickets vendidos por este hilo: Vec local, sin cerrojo.
+                        let mut mis_tickets = Vec::with_capacity(per_worker_cap);
+                        let mut tail_fails: u32 = 0;
+                        while booker.remaining_seats() > 0 {
+                            let tickets = simulate_booking(&mut booker);
+                            if tickets.is_empty() {
+                                // Solo frenamos si estamos en la cola final (pocas plazas restantes).
+                                // Durante la venta normal, un intento vacío se debe simplemente al
+                                // arrepentimiento probabilístico del comprador; el hilo debe atender
+                                // inmediatamente a la siguiente sesión sin pausas.
+                                if booker.remaining_seats() <= num_workers * 2 {
+                                    tail_fails = tail_fails.saturating_add(1);
+                                    if tail_fails <= 2 {
+                                        std::hint::spin_loop();
+                                    } else if tail_fails <= 6 {
+                                        thread::yield_now();
+                                    } else {
+                                        thread::sleep(std::time::Duration::from_micros(30));
+                                    }
+                                }
+                            } else {
+                                tail_fails = 0;
+                                mis_tickets.extend(tickets);
+                            }
+                        }
+                        mis_tickets
+                    })
+                })
+                .collect();
+
+            // Recolección: cada hilo devuelve su Vec al hacer join.
+            for worker in workers {
+                sold_tickets.extend(worker.join().expect("un hilo comprador ha fallado"));
+            }
+        });
+
+        sold_tickets
+    }
+
+    fn get_venue(&self) -> Venue {
+        self.booker.get_venue()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::time::Instant;
+
+    #[test]
+    fn test_full_profile() {
+        println!("\n=======================================================");
+        println!("  INICIANDO TEST DE PERFILADO (CONCURRENT QUEUE)");
+        println!("=======================================================");
+
+        let venue = crate::initialize_venue();
+        let total_capacity = venue.total_capacity();
+        println!("Aforo total a vender: {} entradas", total_capacity);
+
+        let t_start = Instant::now();
+
+        let mut queue_manager = ConcurrentQueueManager::new(venue);
+        let sold_tickets = queue_manager.run();
+
+        let duration = t_start.elapsed();
+        let total_seconds = duration.as_secs_f32() * crate::config::TIME_MULTIPLIER;
+        let hours_float = total_seconds / 3600.0;
+        let throughput = if hours_float > 0.0 {
+            (total_capacity as f32) / hours_float
+        } else {
+            0.0
+        };
+
+        println!("\n------------------ RESULTADOS ------------------");
+        println!("Tiempo real:          {:.2?}", duration);
+        println!("Tiempo simulado:      {:.2} horas", hours_float);
+        println!("THROUGHPUT OBTENIDO:  {:.2} tickets/hora", throughput);
+        println!("Entradas vendidas:    {}/{}", sold_tickets.len(), total_capacity);
+
+        // Verificaciones de negocio estrictas
+        assert_eq!(sold_tickets.len(), total_capacity, "No se vendio el 100%");
+        let unique: HashSet<_> = sold_tickets.iter().collect();
+        assert_eq!(unique.len(), sold_tickets.len(), "Hay tickets duplicados");
+
+        let final_venue = queue_manager.get_venue();
+        assert_eq!(final_venue.total_booked_seats(), total_capacity);
+        assert_eq!(final_venue.total_available_seats(), 0);
+
+        println!("Estado del recinto:   100% vendido, 0 duplicados (CORRECTO)");
+        println!("=======================================================\n");
+    }
+}
+
+==> src/booking.rs <==
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
+use rand::Rng;
+
+#[path = "cas.rs"]
+mod cas;
+use crate::config;
+use crate::venue;
+use crate::venue::{ConcurrentVenue, SectorConcurrente, SectorGeneral, SectorNumerado};
+use crate::venue::{LIBRE, SELECCIONADA, VENDIDA};
+
+/// Trait que define las operaciones del motor de reservas (*Booker*).
+///
+/// Modela la interfaz que utiliza la simulación (`simulation.rs`) para consultar
+/// disponibilidad, reservar provisionalmente localidades y consolidar la compra.
+pub trait Booker {
+    /// Nombre del recinto actual.
+    #[allow(dead_code)]
+    fn get_venue_name(&self) -> &str;
+
+    /// Capacidad total acumulada de todos los sectores del recinto.
+    fn get_total_capacity(&self) -> usize;
+
+    /// Número total de localidades disponibles actualmente en el recinto.
+    #[allow(dead_code)]
+    fn get_total_available_seats(&self) -> usize;
+
+    /// Lista de códigos de los sectores que aún disponen de plazas libres.
+    fn get_available_sectors(&self) -> Vec<String>;
+
+    /// Indica si un sector tiene asientos numerados (`true`) o es de admisión general (`false`).
+    #[allow(dead_code)]
+    fn is_sector_numbered(&self, sector_code: &str) -> bool;
+
+    /// Lista de identificadores de localidades disponibles en el sector indicado.
+    fn get_available_seats(&self, sector_code: &str) -> Vec<String>;
+
+    /// Número de entradas que faltan por vender en todo el recinto.
+    fn remaining_seats(&self) -> usize;
+
+    /// Notifica que una sesión de compra va a interactuar con un sector.
+    fn select_sector(&mut self, sector_code: &str);
+
+    /// Notifica que una sesión de compra abandona el sector sin completar la compra.
+    fn unselect_sector(&mut self, sector_code: &str);
+
+    /// Cancela la reserva provisional de las localidades indicadas,
+    /// devolviéndolas al estado `Available`.
+    fn deselect_seats(&mut self, sector_code: &str, seat_ids: &[String]) -> Result<(), String>;
+
+    /// Bloquea temporalmente las localidades indicadas cambiando su estado a `Selected`.
+    ///
+    /// Retorna `Ok(())` si todas se han podido reservar provisionalmente o `Err` si alguna ya no estaba disponible.
+    fn select_seats(&mut self, sector_code: &str, seat_ids: &[String]) -> Result<(), String>;
+
+    /// Confirma definitivamente la compra de las localidades indicadas pasando su estado a `Booked`.
+    ///
+    /// Retorna `Ok(Vec<String>)` con los identificadores únicos definitivos de las entradas vendidas
+    /// o `Err` si la reserva provisional no era válida o expiró.
+    fn book_seats(&mut self, sector_code: &str, seat_ids: &[String]) -> Result<Vec<String>, String>;
+
+    /// Devuelve una copia/instantánea del recinto (`Venue`) con el estado de todos sus sectores.
+    fn get_venue(&self) -> venue::Venue;
+}
+
+/// Implementación secuencial de referencia del trait `Booker`.
+///
+/// Modifica directamente la estructura `Venue` en memoria sin sincronización multihilo.
+#[allow(dead_code)]
+pub struct SequentialBooker {
+    venue: venue::Venue,
+}
+
+#[allow(dead_code)]
+impl SequentialBooker {
+    pub fn new(venue: venue::Venue) -> Self {
+        Self { venue }
+    }
+}
+
+#[allow(dead_code)]
+impl Booker for SequentialBooker {
+    fn get_venue_name(&self) -> &str {
+        &self.venue.name
+    }
+
+    fn get_total_capacity(&self) -> usize {
+        self.venue.total_capacity()
+    }
+
+    fn get_total_available_seats(&self) -> usize {
+        self.venue.total_available_seats()
+    }
+
+    fn get_available_sectors(&self) -> Vec<String> {
+        self.venue
+            .sectors
+            .iter()
+            .filter(|s| s.n_available_seats() > 0)
+            .map(|s| s.code.clone())
+            .collect()
+    }
+
+    fn is_sector_numbered(&self, sector_code: &str) -> bool {
+        self.venue
+            .sectors
+            .iter()
+            .find(|s| s.code == sector_code)
+            .map(|s| s.is_numbered)
+            .unwrap_or(false)
+    }
+
+    fn get_available_seats(&self, sector_code: &str) -> Vec<String> {
+        if let Some(sector) = self.venue.sectors.iter().find(|s| s.code == sector_code) {
+            sector.get_available_seats().iter().map(|s| s.id.clone()).collect()
+        } else {
+            panic!("Unknown sector: '{sector_code}'");
+        }
+    }
+
+    fn remaining_seats(&self) -> usize {
+        self.venue.total_capacity() - self.venue.total_booked_seats()
+    }
+
+    fn select_sector(&mut self, _sector_code: &str) {
+        // En la versión secuencial básica no requiere acción adicional.
+    }
+
+    fn unselect_sector(&mut self, _sector_code: &str) {
+        // En la versión secuencial básica no requiere acción adicional.
+    }
+
+    fn deselect_seats(&mut self, sector_code: &str, seat_ids: &[String]) -> Result<(), String> {
+        let sector = self
+            .venue
+            .sectors
+            .iter_mut()
+            .find(|s| s.code == sector_code)
+            .ok_or_else(|| format!("Unknown sector: '{sector_code}'"))?;
+
+        // 1. Validación: verificar que todos los asientos existen y están en estado Selected
+        for seat_id in seat_ids {
+            match sector.seats.iter().find(|s| s.id == *seat_id) {
+                Some(seat) if seat.state == venue::SeatState::Selected => {}
+                Some(_) => return Err(format!("Seat {} is not selected", seat_id)),
+                None => return Err(format!("Seat {} does not exist in sector {}", seat_id, sector_code)),
+            }
+        }
+
+        // 2. Transición de estado: Selected -> Available
+        for seat_id in seat_ids {
+            if let Some(seat) = sector.seats.iter_mut().find(|s| s.id == *seat_id) {
+                seat.state = venue::SeatState::Available;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn select_seats(&mut self, sector_code: &str, seat_ids: &[String]) -> Result<(), String> {
+        let sector = self
+            .venue
+            .sectors
+            .iter_mut()
+            .find(|s| s.code == sector_code)
+            .ok_or_else(|| format!("Unknown sector: '{sector_code}'"))?;
+
+        // 1. Validación: verificar que todos los asientos existen y están en estado Available
+        for seat_id in seat_ids {
+            match sector.seats.iter().find(|s| s.id == *seat_id) {
+                Some(seat) if seat.state == venue::SeatState::Available => {}
+                Some(_) => return Err(format!("Seat {} is not available", seat_id)),
+                None => return Err(format!("Seat {} does not exist in sector {}", seat_id, sector_code)),
+            }
+        }
+
+        // 2. Transición de estado: Available -> Selected
+        for seat_id in seat_ids {
+            if let Some(seat) = sector.seats.iter_mut().find(|s| s.id == *seat_id) {
+                seat.state = venue::SeatState::Selected;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn book_seats(&mut self, sector_code: &str, seat_ids: &[String]) -> Result<Vec<String>, String> {
+        let sector = self
+            .venue
+            .sectors
+            .iter_mut()
+            .find(|s| s.code == sector_code)
+            .ok_or_else(|| format!("Unknown sector: '{sector_code}'"))?;
+
+        // 1. Validación: verificar que todos los asientos existen y están en estado Selected
+        for seat_id in seat_ids {
+            match sector.seats.iter().find(|s| s.id == *seat_id) {
+                Some(seat) if seat.state == venue::SeatState::Selected => {}
+                Some(seat) if seat.state == venue::SeatState::Booked => {
+                    return Err(format!("Seat {} is already booked", seat_id));
+                }
+                Some(_) => {
+                    return Err(format!("Seat {} must be selected before booking", seat_id));
+                }
+                None => return Err(format!("Seat {} does not exist in sector {}", seat_id, sector_code)),
+            }
+        }
+
+        // 2. Transición de estado: Selected -> Booked
+        for seat_id in seat_ids {
+            if let Some(seat) = sector.seats.iter_mut().find(|s| s.id == *seat_id) {
+                seat.state = venue::SeatState::Booked;
+            }
+        }
+
+        Ok(seat_ids.to_vec())
+    }
+
+    fn get_venue(&self) -> venue::Venue {
+        self.venue.clone()
+    }
+}
+
+// ===========================================================================
+//  BOOKER CONCURRENTE (sin cerrojos)
+//
+//  - Sectores de admisión general: un contador atómico de plazas libres.
+//  - Sectores numerados: un atómico por butaca, modificado con CAS.
+//
+//  El struct solo guarda un `Arc` al recinto compartido, así que clonarlo es
+//  barato: cada hilo trabaja con SU clon (por eso el `&mut self` del trait no
+//  es un problema) y todos los clones ven el mismo estado.
+// ===========================================================================
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct ConcurrentBooker {
+    shared: Arc<ConcurrentVenue>,
+}
+
+#[allow(dead_code)]
+impl ConcurrentBooker {
+    pub fn new(venue: venue::Venue) -> Self {
+        ConcurrentBooker {
+            shared: Arc::new(ConcurrentVenue::from_venue(&venue)),
+        }
+    }
+
+    fn sector(&self, sector_code: &str) -> Result<&SectorConcurrente, String> {
+        self.shared
+            .sector(sector_code)
+            .ok_or_else(|| format!("Unknown sector: '{sector_code}'"))
+    }
+
+    /// Traduce los IDs de butaca a posiciones del vector de atómicos.
+    fn indices(sector: &SectorNumerado, seat_ids: &[String]) -> Result<Vec<usize>, String> {
+        let mut idxs = Vec::with_capacity(seat_ids.len());
+        for id in seat_ids {
+            let idx = sector
+                .index_of(id)
+                .ok_or_else(|| format!("Seat {} does not exist in sector {}", id, sector.code))?;
+            idxs.push(idx);
+        }
+        Ok(idxs)
+    }
+
+    // ----------------------- Admisión general -----------------------------
+
+    /// Reserva `n` plazas: resta `n` al contador solo si quedan suficientes.
+    /// `fetch_update` es el bucle leer -> calcular -> CAS -> reintentar.
+    #[inline(always)]
+    fn select_general(sector: &SectorGeneral, n: usize) -> Result<(), String> {
+        sector
+            .available
+            .0
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |libres| {
+                if libres >= n {
+                    Some(libres - n)
+                } else {
+                    None
+                }
+            })
+            .map(|_| {
+                sector.selected.0.fetch_add(n, Ordering::AcqRel);
+            })
+            .map_err(|_| format!("Not enough seats available in sector {}", sector.code))
+    }
+
+    /// Venta definitiva: los IDs salen de un contador, así que son únicos.
+    #[inline(always)]
+    fn book_general(&self, sector: &SectorGeneral, n: usize) -> Vec<String> {
+        let primero = sector.next_ticket.0.fetch_add(n, Ordering::AcqRel);
+        // Usa directamente los IDs precreados del Venue original (cero format!)
+        let tickets = if primero + n <= sector.ids.len() {
+            sector.ids[primero..primero + n].to_vec()
+        } else {
+            (primero + 1..=primero + n)
+                .map(|i| format!("{}-{}", sector.code, i))
+                .collect()
+        };
+        // Decremento atómico wait-free sin bucle CAS (evita contención en caché)
+        sector.selected.0.fetch_sub(n, Ordering::Relaxed);
+        sector.booked.0.fetch_add(n, Ordering::AcqRel);
+        // El total global se actualiza lo último: `remaining_seats()` nunca
+        // llega a 0 antes de que la venta esté hecha de verdad.
+        self.shared.total_booked.0.fetch_add(n, Ordering::AcqRel);
+        tickets
+    }
+
+    // ----------------------- Sectores numerados ---------------------------
+
+}
+
+impl Booker for ConcurrentBooker {
+    fn get_venue_name(&self) -> &str {
+        &self.shared.name
+    }
+
+    fn get_total_capacity(&self) -> usize {
+        self.shared.capacity
+    }
+
+    fn get_total_available_seats(&self) -> usize {
+        self.shared.sectors.iter().map(|s| s.available()).sum()
+    }
+
+    fn get_available_sectors(&self) -> Vec<String> {
+        let mut available = Vec::with_capacity(self.shared.sectors.len());
+        for s in &self.shared.sectors {
+            if s.available_relaxed() > 0 {
+                available.push(s.code().to_string());
+            }
+        }
+        available
+    }
+
+    fn is_sector_numbered(&self, sector_code: &str) -> bool {
+        self.shared
+            .sector(sector_code)
+            .map(|s| s.is_numbered())
+            .unwrap_or(false)
+    }
+
+    fn get_available_seats(&self, sector_code: &str) -> Vec<String> {
+        match self.shared.sector(sector_code) {
+            // En admisión general tomamos las primeras n etiquetas directamente
+            // del vector de IDs original (cero format!, cero allocations).
+            Some(SectorConcurrente::General(s)) => {
+                let n = s.available.get().min(config::MAX_TICKETS);
+                if n <= s.ids.len() {
+                    s.ids[..n].to_vec()
+                } else {
+                    (1..=n).map(|i| format!("{}-{}", s.code, i)).collect()
+                }
+            }
+            // Para sectores numerados solo necesitamos MAX_TICKETS*4 candidatos:
+            // simulate_booking llama a choose_multiple(n_tickets) sobre este Vec,
+            // así que con 24 candidatos hay suficiente variedad sin clonar hasta 300 strings.
+            // Empezamos por un índice aleatorio para repartir la contención CAS
+            // entre hilos: sin esto todos compiten por los mismos asientos bajos.
+            // Usamos Relaxed porque es una lectura de observación; el CAS posterior
+            // garantiza la atomicidad real de la reserva.
+            Some(SectorConcurrente::Numerado(s)) => {
+                let limit = (config::MAX_TICKETS * 4).min(s.capacity);
+                let start = if s.capacity > 1 {
+                    rand::rng().random_range(0..s.capacity)
+                } else {
+                    0
+                };
+                let mut available = Vec::with_capacity(limit);
+                // Recorrido directo por rebanadas con parada temprana inmediata
+                for i in (start..s.capacity).chain(0..start) {
+                    if s.seats[i].load(Ordering::Relaxed) == LIBRE {
+                        available.push(s.ids[i].clone());
+                        if available.len() == limit {
+                            break;
+                        }
+                    }
+                }
+                available
+            }
+            None => panic!("Unknown sector: '{sector_code}'"),
+        }
+    }
+
+    fn remaining_seats(&self) -> usize {
+        // Relaxed basta: solo se usa para la condición del while loop,
+        // no necesita ser un valor exacto, solo "¿queda algo?"
+        self.shared.capacity.saturating_sub(self.shared.total_booked.0.load(Ordering::Relaxed))
+    }
+
+    fn select_sector(&mut self, _sector_code: &str) {
+        // No hace falta ninguna acción.
+    }
+
+    fn unselect_sector(&mut self, _sector_code: &str) {
+        // No hace falta ninguna acción.
+    }
+
+    fn deselect_seats(&mut self, sector_code: &str, seat_ids: &[String]) -> Result<(), String> {
+        match self.sector(sector_code)? {
+            SectorConcurrente::General(s) => {
+                let n = seat_ids.len();
+                // Decremento atómico wait-free sin bucle CAS
+                s.selected.0.fetch_sub(n, Ordering::Relaxed);
+                s.available.0.fetch_add(n, Ordering::AcqRel);
+                Ok(())
+            }
+            SectorConcurrente::Numerado(s) => {
+                let mut idxs = Self::indices(s, seat_ids)?;
+                idxs.sort_unstable();
+                cas::cambiar_todas(s, &idxs, SELECCIONADA, LIBRE)
+                    .map_err(|i| format!("Seat {} is not selected", s.ids[i]))?;
+                s.available.0.fetch_add(idxs.len(), Ordering::AcqRel);
+                Ok(())
+            }
+        }
+    }
+
+    fn select_seats(&mut self, sector_code: &str, seat_ids: &[String]) -> Result<(), String> {
+        match self.sector(sector_code)? {
+            SectorConcurrente::General(s) => Self::select_general(s, seat_ids.len()),
+            SectorConcurrente::Numerado(s) => {
+                let mut idxs = Self::indices(s, seat_ids)?;
+                idxs.sort_unstable();
+                cas::cambiar_todas(s, &idxs, LIBRE, SELECCIONADA)
+                    .map_err(|i| format!("Seat {} is not available", s.ids[i]))?;
+                s.available.0.fetch_sub(idxs.len(), Ordering::AcqRel);
+                Ok(())
+            }
+        }
+    }
+
+    fn book_seats(&mut self, sector_code: &str, seat_ids: &[String]) -> Result<Vec<String>, String> {
+        match self.sector(sector_code)? {
+            SectorConcurrente::General(s) => Ok(self.book_general(s, seat_ids.len())),
+            SectorConcurrente::Numerado(s) => {
+                let mut idxs = Self::indices(s, seat_ids)?;
+                idxs.sort_unstable();
+                match cas::cambiar_todas(s, &idxs, SELECCIONADA, VENDIDA) {
+                    Ok(()) => {
+                        s.booked.0.fetch_add(idxs.len(), Ordering::AcqRel);
+                        self.shared.total_booked.0.fetch_add(idxs.len(), Ordering::AcqRel);
+                        Ok(seat_ids.to_vec())
+                    }
+                    Err(i) => {
+                        // Safety net: simulation.rs no llama a deselect_seats
+                        // cuando book_seats falla, así que liberamos aquí los
+                        // asientos que sigan en SELECCIONADA para no perderlos.
+                        for &idx in &idxs {
+                            if s.seats[idx]
+                                .compare_exchange(SELECCIONADA, LIBRE, Ordering::AcqRel, Ordering::Acquire)
+                                .is_ok()
+                            {
+                                s.available.0.fetch_add(1, Ordering::AcqRel);
+                            }
+                        }
+                        Err(format!("Seat {} must be selected before booking", s.ids[i]))
+                    }
+                }
+            }
+        }
+    }
+
+    fn get_venue(&self) -> venue::Venue {
+        self.shared.snapshot()
+    }
+}
+
+==> src/venue.rs <==
+use std::fmt;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+
+/// Modelo de un recinto (*Venue*), compuesto por un nombre y múltiples sectores.
+#[derive(Clone)]
+pub struct Venue {
+    pub name: String,
+    pub sectors: Vec<Sector>,
+}
+
+impl Venue {
+    /// Capacidad total sumando todos los sectores.
+    pub fn total_capacity(&self) -> usize {
+        self.sectors.iter().map(|s| s.capacity).sum()
+    }
+
+    /// Total de asientos disponibles sumando todos los sectores.
+    pub fn total_available_seats(&self) -> usize {
+        self.sectors.iter().map(|s| s.n_available_seats()).sum()
+    }
+
+    /// Total de asientos ya vendidos (*Booked*) sumando todos los sectores.
+    pub fn total_booked_seats(&self) -> usize {
+        self.sectors.iter().map(|s| s.n_booked_seats()).sum()
+    }
+}
+
+impl fmt::Display for Venue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} {}/{}\n",
+            self.name,
+            self.total_booked_seats(),
+            self.total_capacity(),
+        )?;
+
+        write!(f, "Sectors:\n")?;
+
+        for sector in &self.sectors {
+            write!(
+                f,
+                "  - {} ({}) {}/{}\n",
+                sector.name,
+                sector.code,
+                sector.n_booked_seats(),
+                sector.capacity,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Representa un sector dentro del recinto.
+///
+/// Cada sector tiene un nombre descriptivo, un código corto (p. ej. `"ST"`, `"S1"`),
+/// un vector de asientos (`Seat`), una capacidad total y una bandera que indica
+/// si los asientos son numerados (`is_numbered: true`) o de admisión general (`false`).
+#[derive(Clone)]
+pub struct Sector {
+    pub name: String,
+    pub code: String,
+    pub seats: Vec<Seat>,
+    pub capacity: usize,
+    pub is_numbered: bool,
+}
+
+/// Estado en el que se encuentra un asiento o localidad.
+#[derive(PartialEq, Clone)]
+pub enum SeatState {
+    /// Asiento libre, disponible para selección.
+    Available,
+    /// Asiento bloqueado provisionalmente por una sesión de compra.
+    Selected,
+    /// Asiento vendido definitivamente.
+    Booked,
+}
+
+/// Representa una localidad individual con su estado e identificador único.
+#[derive(Clone)]
+pub struct Seat {
+    pub state: SeatState,
+    pub id: String,
+}
+
+impl Sector {
+    /// Crea un nuevo sector inicializando todos sus asientos en estado `Available`.
+    pub fn new(name: &str, code: &str, capacity: usize, is_numbered: bool) -> Sector {
+        let seats = (1..=capacity)
+            .map(|i| Seat {
+                state: SeatState::Available,
+                id: format!("{}-{}", code, i),
+            })
+            .collect();
+
+        Sector {
+            name: name.to_string(),
+            code: code.to_string(),
+            seats,
+            capacity,
+            is_numbered,
+        }
+    }
+
+    /// Devuelve referencias a todos los asientos que se encuentran actualmente disponibles.
+    pub fn get_available_seats(&self) -> Vec<&Seat> {
+        self.seats.iter().filter(|s| s.state == SeatState::Available).collect()
+    }
+
+    /// Devuelve el número de asientos actualmente en estado `Available`.
+    pub fn n_available_seats(&self) -> usize {
+        self.seats.iter().filter(|s| s.state == SeatState::Available).count()
+    }
+
+    /// Devuelve el número de asientos actualmente en estado `Booked`.
+    pub fn n_booked_seats(&self) -> usize {
+        self.seats.iter().filter(|s| s.state == SeatState::Booked).count()
+    }
+}
+
+// ===========================================================================
+//  MODELO CONCURRENTE
+//  Todo el estado que cambia durante la venta está en atómicos, así que se
+//  puede compartir entre hilos con un `Arc` sin ningún `Mutex`.
+//  El `Venue` de arriba se sigue usando como "foto": se recibe al principio
+//  (`from_venue`) y se reconstruye al final (`snapshot`).
+// ===========================================================================
+
+/// Estados de una butaca numerada guardados en un `AtomicU8`.
+pub const LIBRE: u8 = 0;
+pub const SELECCIONADA: u8 = 1;
+pub const VENDIDA: u8 = 2;
+
+/// Contador atómico alineado a 64 bytes (una línea de caché).
+/// Así dos contadores distintos nunca comparten línea y no hay
+/// falso compartido entre sectores.
+#[repr(align(64))]
+pub struct Contador(pub AtomicUsize);
+
+impl Contador {
+    #[allow(dead_code)]
+    pub fn new(valor: usize) -> Self {
+        Contador(AtomicUsize::new(valor))
+    }
+
+    /// Lectura del valor actual (con barrera Acquire).
+    pub fn get(&self) -> usize {
+        self.0.load(Ordering::Acquire)
+    }
+
+    /// Lectura relajada (para observaciones no críticas en el hot path).
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub fn get_relaxed(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// Sector de admisión general (sin butaca concreta): solo importa cuántas
+/// plazas quedan, así que basta con contadores.
+#[allow(dead_code)]
+pub struct SectorGeneral {
+    pub name: String,
+    pub code: String,
+    pub capacity: usize,
+    /// Plazas libres (ni seleccionadas ni vendidas).
+    pub available: Contador,
+    /// Plazas bloqueadas provisionalmente por compradores.
+    pub selected: Contador,
+    /// Plazas vendidas definitivamente.
+    pub booked: Contador,
+    /// Siguiente número de ticket a emitir (genera IDs únicos "ST-1", "ST-2"...).
+    pub next_ticket: Contador,
+    /// Identificadores de tickets tomados del Venue original (evita allocaciones de strings).
+    pub ids: Vec<String>,
+}
+
+/// Sector numerado: cada butaca tiene su propio estado atómico.
+#[allow(dead_code)]
+pub struct SectorNumerado {
+    pub name: String,
+    pub code: String,
+    pub capacity: usize,
+    /// IDs de las butacas ("S3-1", "S3-2"...). Solo lectura: no necesita sincronización.
+    pub ids: Vec<String>,
+    /// Estado de cada butaca: LIBRE, SELECCIONADA o VENDIDA.
+    pub seats: Vec<AtomicU8>,
+    pub available: Contador,
+    pub booked: Contador,
+}
+
+#[allow(dead_code)]
+impl SectorNumerado {
+    /// Traduce un ID de butaca ("S3-17") a su posición en `seats` (16).
+    /// Fast path O(1): lee el número tras el último '-'. Los IDs siempre
+    /// siguen el formato "CODE-N" generado por Sector::new, así que
+    /// basta verificar que el índice esté en rango.
+    #[inline(always)]
+    pub fn index_of(&self, seat_id: &str) -> Option<usize> {
+        let numero: usize = seat_id.rsplit('-').next()?.parse().ok()?;
+        let idx = numero.checked_sub(1)?;
+        if idx < self.capacity {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub enum SectorConcurrente {
+    General(SectorGeneral),
+    Numerado(SectorNumerado),
+}
+
+#[allow(dead_code)]
+impl SectorConcurrente {
+    pub fn code(&self) -> &str {
+        match self {
+            SectorConcurrente::General(s) => &s.code,
+            SectorConcurrente::Numerado(s) => &s.code,
+        }
+    }
+
+    pub fn is_numbered(&self) -> bool {
+        matches!(self, SectorConcurrente::Numerado(_))
+    }
+
+    pub fn available(&self) -> usize {
+        match self {
+            SectorConcurrente::General(s) => s.available.get(),
+            SectorConcurrente::Numerado(s) => s.available.get(),
+        }
+    }
+
+    /// Lectura relajada de plazas disponibles (solo para filtrados de observación).
+    pub fn available_relaxed(&self) -> usize {
+        match self {
+            SectorConcurrente::General(s) => s.available.0.load(Ordering::Relaxed),
+            SectorConcurrente::Numerado(s) => s.available.0.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Recinto compartido entre todos los hilos (dentro de un `Arc`).
+#[allow(dead_code)]
+pub struct ConcurrentVenue {
+    pub name: String,
+    pub sectors: Vec<SectorConcurrente>,
+    pub capacity: usize,
+    /// Total de entradas vendidas en todo el recinto.
+    pub total_booked: Contador,
+}
+
+#[allow(dead_code)]
+impl ConcurrentVenue {
+    /// Construye el estado concurrente a partir del `Venue` inicial.
+    pub fn from_venue(venue: &Venue) -> Self {
+        let mut sectors = Vec::with_capacity(venue.sectors.len());
+        let mut total_booked = 0;
+
+        for s in venue.sectors.iter() {
+            let available = s.n_available_seats();
+            let booked = s.n_booked_seats();
+            total_booked += booked;
+
+            if s.is_numbered {
+                let seats = s
+                    .seats
+                    .iter()
+                    .map(|seat| {
+                        AtomicU8::new(match seat.state {
+                            SeatState::Available => LIBRE,
+                            SeatState::Selected => SELECCIONADA,
+                            SeatState::Booked => VENDIDA,
+                        })
+                    })
+                    .collect();
+                sectors.push(SectorConcurrente::Numerado(SectorNumerado {
+                    name: s.name.clone(),
+                    code: s.code.clone(),
+                    capacity: s.capacity,
+                    ids: s.seats.iter().map(|seat| seat.id.clone()).collect(),
+                    seats,
+                    available: Contador::new(available),
+                    booked: Contador::new(booked),
+                }));
+            } else {
+                sectors.push(SectorConcurrente::General(SectorGeneral {
+                    name: s.name.clone(),
+                    code: s.code.clone(),
+                    capacity: s.capacity,
+                    available: Contador::new(available),
+                    selected: Contador::new(0),
+                    booked: Contador::new(booked),
+                    next_ticket: Contador::new(booked),
+                    ids: s.seats.iter().map(|seat| seat.id.clone()).collect(),
+                }));
+            }
+        }
+
+        ConcurrentVenue {
+            name: venue.name.clone(),
+            sectors,
+            capacity: venue.total_capacity(),
+            total_booked: Contador::new(total_booked),
+        }
+    }
+
+    /// Busca un sector por su código.
+    /// Con ≤30 sectores la búsqueda lineal es más rápida que el HashMap
+    /// por mejor localidad de caché (no hay indirección de hash ni posible miss).
+    #[inline(always)]
+    pub fn sector(&self, code: &str) -> Option<&SectorConcurrente> {
+        self.sectors.iter().find(|s| s.code() == code)
+    }
+
+    /// Reconstruye un `Venue` normal con el estado actual (para `get_venue`).
+    pub fn snapshot(&self) -> Venue {
+        let sectors = self
+            .sectors
+            .iter()
+            .map(|sc| match sc {
+                SectorConcurrente::General(s) => {
+                    let booked = s.booked.get();
+                    let available = s.available.get();
+                    let selected = s.capacity.saturating_sub(booked + available);
+                    // Reutilizamos los IDs precalculados para evitar miles de format!
+                    let seats = s
+                        .ids
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, id)| {
+                            let i = idx + 1;
+                            Seat {
+                                id: id.clone(),
+                                state: if i <= booked {
+                                    SeatState::Booked
+                                } else if i <= booked + selected {
+                                    SeatState::Selected
+                                } else {
+                                    SeatState::Available
+                                },
+                            }
+                        })
+                        .collect();
+                    Sector {
+                        name: s.name.clone(),
+                        code: s.code.clone(),
+                        capacity: s.capacity,
+                        is_numbered: false,
+                        seats,
+                    }
+                }
+                SectorConcurrente::Numerado(s) => Sector {
+                    name: s.name.clone(),
+                    code: s.code.clone(),
+                    capacity: s.capacity,
+                    is_numbered: true,
+                    seats: s
+                        .ids
+                        .iter()
+                        .zip(&s.seats)
+                        .map(|(id, st)| Seat {
+                            id: id.clone(),
+                            state: match st.load(Ordering::Acquire) {
+                                LIBRE => SeatState::Available,
+                                SELECCIONADA => SeatState::Selected,
+                                _ => SeatState::Booked,
+                            },
+                        })
+                        .collect(),
+                },
+            })
+            .collect();
+
+        Venue {
+            name: self.name.clone(),
+            sectors,
+        }
+    }
+}
+
+==> src/cas.rs <==
+use std::sync::atomic::Ordering;
+
+use crate::venue::SectorNumerado;
+
+/// Intenta cambiar todas las butacas de un estado a otro con CAS.
+///
+/// Si una butaca falla, revierte las anteriores y devuelve su índice.
+/// El rollback usa CAS (no store) para no sobreescribir un cambio
+/// que otro hilo haya hecho entre medias.
+#[allow(dead_code)]
+#[inline(always)]
+pub(crate) fn cambiar_todas(
+    sector: &SectorNumerado,
+    idxs: &[usize],
+    desde: u8,
+    hasta: u8,
+) -> Result<(), usize> {
+    for (k, &i) in idxs.iter().enumerate() {
+        if sector.seats[i]
+            .compare_exchange(desde, hasta, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            // Rollback seguro: solo revertimos si el asiento sigue en el
+            // estado que NOSOTROS le pusimos (`hasta`). Si otro hilo ya lo
+            // cambió (p.ej. a VENDIDA), no lo tocamos.
+            for &j in &idxs[..k] {
+                let _ = sector.seats[j].compare_exchange(
+                    hasta, desde,
+                    Ordering::AcqRel, Ordering::Acquire,
+                );
+            }
+            return Err(i);
+        }
+    }
+    Ok(())
+}

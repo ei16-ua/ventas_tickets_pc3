@@ -11,62 +11,26 @@ use crate::venue::{ConcurrentVenue, SectorConcurrente, SectorGeneral, SectorNume
 use crate::venue::{LIBRE, SELECCIONADA, VENDIDA};
 
 /// Trait que define las operaciones del motor de reservas (*Booker*).
-///
-/// Modela la interfaz que utiliza la simulación (`simulation.rs`) para consultar
-/// disponibilidad, reservar provisionalmente localidades y consolidar la compra.
 pub trait Booker {
-    /// Nombre del recinto actual.
     #[allow(dead_code)]
     fn get_venue_name(&self) -> &str;
-
-    /// Capacidad total acumulada de todos los sectores del recinto.
     fn get_total_capacity(&self) -> usize;
-
-    /// Número total de localidades disponibles actualmente en el recinto.
     #[allow(dead_code)]
     fn get_total_available_seats(&self) -> usize;
-
-    /// Lista de códigos de los sectores que aún disponen de plazas libres.
     fn get_available_sectors(&self) -> Vec<String>;
-
-    /// Indica si un sector tiene asientos numerados (`true`) o es de admisión general (`false`).
     #[allow(dead_code)]
     fn is_sector_numbered(&self, sector_code: &str) -> bool;
-
-    /// Lista de identificadores de localidades disponibles en el sector indicado.
     fn get_available_seats(&self, sector_code: &str) -> Vec<String>;
-
-    /// Número de entradas que faltan por vender en todo el recinto.
     fn remaining_seats(&self) -> usize;
-
-    /// Notifica que una sesión de compra va a interactuar con un sector.
     fn select_sector(&mut self, sector_code: &str);
-
-    /// Notifica que una sesión de compra abandona el sector sin completar la compra.
     fn unselect_sector(&mut self, sector_code: &str);
-
-    /// Cancela la reserva provisional de las localidades indicadas,
-    /// devolviéndolas al estado `Available`.
     fn deselect_seats(&mut self, sector_code: &str, seat_ids: &[String]) -> Result<(), String>;
-
-    /// Bloquea temporalmente las localidades indicadas cambiando su estado a `Selected`.
-    ///
-    /// Retorna `Ok(())` si todas se han podido reservar provisionalmente o `Err` si alguna ya no estaba disponible.
     fn select_seats(&mut self, sector_code: &str, seat_ids: &[String]) -> Result<(), String>;
-
-    /// Confirma definitivamente la compra de las localidades indicadas pasando su estado a `Booked`.
-    ///
-    /// Retorna `Ok(Vec<String>)` con los identificadores únicos definitivos de las entradas vendidas
-    /// o `Err` si la reserva provisional no era válida o expiró.
     fn book_seats(&mut self, sector_code: &str, seat_ids: &[String]) -> Result<Vec<String>, String>;
-
-    /// Devuelve una copia/instantánea del recinto (`Venue`) con el estado de todos sus sectores.
     fn get_venue(&self) -> venue::Venue;
 }
 
 /// Implementación secuencial de referencia del trait `Booker`.
-///
-/// Modifica directamente la estructura `Venue` en memoria sin sincronización multihilo.
 #[allow(dead_code)]
 pub struct SequentialBooker {
     venue: venue::Venue,
@@ -123,13 +87,8 @@ impl Booker for SequentialBooker {
         self.venue.total_capacity() - self.venue.total_booked_seats()
     }
 
-    fn select_sector(&mut self, _sector_code: &str) {
-        // En la versión secuencial básica no requiere acción adicional.
-    }
-
-    fn unselect_sector(&mut self, _sector_code: &str) {
-        // En la versión secuencial básica no requiere acción adicional.
-    }
+    fn select_sector(&mut self, _sector_code: &str) {}
+    fn unselect_sector(&mut self, _sector_code: &str) {}
 
     fn deselect_seats(&mut self, sector_code: &str, seat_ids: &[String]) -> Result<(), String> {
         let sector = self
@@ -139,7 +98,6 @@ impl Booker for SequentialBooker {
             .find(|s| s.code == sector_code)
             .ok_or_else(|| format!("Unknown sector: '{sector_code}'"))?;
 
-        // 1. Validación: verificar que todos los asientos existen y están en estado Selected
         for seat_id in seat_ids {
             match sector.seats.iter().find(|s| s.id == *seat_id) {
                 Some(seat) if seat.state == venue::SeatState::Selected => {}
@@ -148,7 +106,6 @@ impl Booker for SequentialBooker {
             }
         }
 
-        // 2. Transición de estado: Selected -> Available
         for seat_id in seat_ids {
             if let Some(seat) = sector.seats.iter_mut().find(|s| s.id == *seat_id) {
                 seat.state = venue::SeatState::Available;
@@ -166,7 +123,6 @@ impl Booker for SequentialBooker {
             .find(|s| s.code == sector_code)
             .ok_or_else(|| format!("Unknown sector: '{sector_code}'"))?;
 
-        // 1. Validación: verificar que todos los asientos existen y están en estado Available
         for seat_id in seat_ids {
             match sector.seats.iter().find(|s| s.id == *seat_id) {
                 Some(seat) if seat.state == venue::SeatState::Available => {}
@@ -175,7 +131,6 @@ impl Booker for SequentialBooker {
             }
         }
 
-        // 2. Transición de estado: Available -> Selected
         for seat_id in seat_ids {
             if let Some(seat) = sector.seats.iter_mut().find(|s| s.id == *seat_id) {
                 seat.state = venue::SeatState::Selected;
@@ -193,7 +148,6 @@ impl Booker for SequentialBooker {
             .find(|s| s.code == sector_code)
             .ok_or_else(|| format!("Unknown sector: '{sector_code}'"))?;
 
-        // 1. Validación: verificar que todos los asientos existen y están en estado Selected
         for seat_id in seat_ids {
             match sector.seats.iter().find(|s| s.id == *seat_id) {
                 Some(seat) if seat.state == venue::SeatState::Selected => {}
@@ -207,7 +161,6 @@ impl Booker for SequentialBooker {
             }
         }
 
-        // 2. Transición de estado: Selected -> Booked
         for seat_id in seat_ids {
             if let Some(seat) = sector.seats.iter_mut().find(|s| s.id == *seat_id) {
                 seat.state = venue::SeatState::Booked;
@@ -224,13 +177,6 @@ impl Booker for SequentialBooker {
 
 // ===========================================================================
 //  BOOKER CONCURRENTE (sin cerrojos)
-//
-//  - Sectores de admisión general: un contador atómico de plazas libres.
-//  - Sectores numerados: un atómico por butaca, modificado con CAS.
-//
-//  El struct solo guarda un `Arc` al recinto compartido, así que clonarlo es
-//  barato: cada hilo trabaja con SU clon (por eso el `&mut self` del trait no
-//  es un problema) y todos los clones ven el mismo estado.
 // ===========================================================================
 #[allow(dead_code)]
 #[derive(Clone)]
@@ -252,7 +198,6 @@ impl ConcurrentBooker {
             .ok_or_else(|| format!("Unknown sector: '{sector_code}'"))
     }
 
-    /// Traduce los IDs de butaca a posiciones del vector de atómicos.
     fn indices(sector: &SectorNumerado, seat_ids: &[String]) -> Result<Vec<usize>, String> {
         let mut idxs = Vec::with_capacity(seat_ids.len());
         for id in seat_ids {
@@ -266,31 +211,23 @@ impl ConcurrentBooker {
 
     // ----------------------- Admisión general -----------------------------
 
-    /// Reserva `n` plazas: resta `n` al contador solo si quedan suficientes.
-    /// `fetch_update` es el bucle leer -> calcular -> CAS -> reintentar.
+    /// Reserva `n` plazas atómicamente solo si quedan suficientes.
     #[inline(always)]
     fn select_general(sector: &SectorGeneral, n: usize) -> Result<(), String> {
         sector
             .available
             .0
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |libres| {
-                if libres >= n {
-                    Some(libres - n)
-                } else {
-                    None
-                }
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |libres| {
+                (libres >= n).then_some(libres - n)
             })
-            .map(|_| {
-                sector.selected.0.fetch_add(n, Ordering::AcqRel);
-            })
+            .map(|_| ())
             .map_err(|_| format!("Not enough seats available in sector {}", sector.code))
     }
 
-    /// Venta definitiva: los IDs salen de un contador, así que son únicos.
+    /// Venta definitiva: los IDs salen de un contador atómico, garantizando unicidad.
     #[inline(always)]
     fn book_general(&self, sector: &SectorGeneral, n: usize) -> Vec<String> {
         let primero = sector.next_ticket.0.fetch_add(n, Ordering::AcqRel);
-        // Usa directamente los IDs precreados del Venue original (cero format!)
         let tickets = if primero + n <= sector.ids.len() {
             sector.ids[primero..primero + n].to_vec()
         } else {
@@ -298,17 +235,12 @@ impl ConcurrentBooker {
                 .map(|i| format!("{}-{}", sector.code, i))
                 .collect()
         };
-        // Decremento atómico wait-free sin bucle CAS (evita contención en caché)
-        sector.selected.0.fetch_sub(n, Ordering::Relaxed);
         sector.booked.0.fetch_add(n, Ordering::AcqRel);
-        // El total global se actualiza lo último: `remaining_seats()` nunca
-        // llega a 0 antes de que la venta esté hecha de verdad.
+        // El total global se actualiza al final: `remaining_seats()` nunca
+        // llega a 0 antes de consolidar la venta.
         self.shared.total_booked.0.fetch_add(n, Ordering::AcqRel);
         tickets
     }
-
-    // ----------------------- Sectores numerados ---------------------------
-
 }
 
 impl Booker for ConcurrentBooker {
@@ -343,8 +275,6 @@ impl Booker for ConcurrentBooker {
 
     fn get_available_seats(&self, sector_code: &str) -> Vec<String> {
         match self.shared.sector(sector_code) {
-            // En admisión general tomamos las primeras n etiquetas directamente
-            // del vector de IDs original (cero format!, cero allocations).
             Some(SectorConcurrente::General(s)) => {
                 let n = s.available.get().min(config::MAX_TICKETS);
                 if n <= s.ids.len() {
@@ -353,13 +283,6 @@ impl Booker for ConcurrentBooker {
                     (1..=n).map(|i| format!("{}-{}", s.code, i)).collect()
                 }
             }
-            // Para sectores numerados solo necesitamos MAX_TICKETS*4 candidatos:
-            // simulate_booking llama a choose_multiple(n_tickets) sobre este Vec,
-            // así que con 24 candidatos hay suficiente variedad sin clonar hasta 300 strings.
-            // Empezamos por un índice aleatorio para repartir la contención CAS
-            // entre hilos: sin esto todos compiten por los mismos asientos bajos.
-            // Usamos Relaxed porque es una lectura de observación; el CAS posterior
-            // garantiza la atomicidad real de la reserva.
             Some(SectorConcurrente::Numerado(s)) => {
                 let limit = (config::MAX_TICKETS * 4).min(s.capacity);
                 let start = if s.capacity > 1 {
@@ -368,7 +291,6 @@ impl Booker for ConcurrentBooker {
                     0
                 };
                 let mut available = Vec::with_capacity(limit);
-                // Recorrido directo por rebanadas con parada temprana inmediata
                 for i in (start..s.capacity).chain(0..start) {
                     if s.seats[i].load(Ordering::Relaxed) == LIBRE {
                         available.push(s.ids[i].clone());
@@ -384,26 +306,18 @@ impl Booker for ConcurrentBooker {
     }
 
     fn remaining_seats(&self) -> usize {
-        // Relaxed basta: solo se usa para la condición del while loop,
-        // no necesita ser un valor exacto, solo "¿queda algo?"
-        self.shared.capacity.saturating_sub(self.shared.total_booked.0.load(Ordering::Relaxed))
+        self.shared
+            .capacity
+            .saturating_sub(self.shared.total_booked.0.load(Ordering::Acquire))
     }
 
-    fn select_sector(&mut self, _sector_code: &str) {
-        // No hace falta ninguna acción.
-    }
-
-    fn unselect_sector(&mut self, _sector_code: &str) {
-        // No hace falta ninguna acción.
-    }
+    fn select_sector(&mut self, _sector_code: &str) {}
+    fn unselect_sector(&mut self, _sector_code: &str) {}
 
     fn deselect_seats(&mut self, sector_code: &str, seat_ids: &[String]) -> Result<(), String> {
         match self.sector(sector_code)? {
             SectorConcurrente::General(s) => {
-                let n = seat_ids.len();
-                // Decremento atómico wait-free sin bucle CAS
-                s.selected.0.fetch_sub(n, Ordering::Relaxed);
-                s.available.0.fetch_add(n, Ordering::AcqRel);
+                s.available.0.fetch_add(seat_ids.len(), Ordering::AcqRel);
                 Ok(())
             }
             SectorConcurrente::Numerado(s) => {
@@ -411,7 +325,7 @@ impl Booker for ConcurrentBooker {
                 idxs.sort_unstable();
                 cas::cambiar_todas(s, &idxs, SELECCIONADA, LIBRE)
                     .map_err(|i| format!("Seat {} is not selected", s.ids[i]))?;
-                s.available.0.fetch_add(idxs.len(), Ordering::AcqRel);
+                s.available.add(idxs.len());
                 Ok(())
             }
         }
@@ -425,7 +339,7 @@ impl Booker for ConcurrentBooker {
                 idxs.sort_unstable();
                 cas::cambiar_todas(s, &idxs, LIBRE, SELECCIONADA)
                     .map_err(|i| format!("Seat {} is not available", s.ids[i]))?;
-                s.available.0.fetch_sub(idxs.len(), Ordering::AcqRel);
+                s.available.sub(idxs.len());
                 Ok(())
             }
         }
@@ -439,20 +353,26 @@ impl Booker for ConcurrentBooker {
                 idxs.sort_unstable();
                 match cas::cambiar_todas(s, &idxs, SELECCIONADA, VENDIDA) {
                     Ok(()) => {
-                        s.booked.0.fetch_add(idxs.len(), Ordering::AcqRel);
-                        self.shared.total_booked.0.fetch_add(idxs.len(), Ordering::AcqRel);
+                        self.shared
+                            .total_booked
+                            .0
+                            .fetch_add(idxs.len(), Ordering::AcqRel);
                         Ok(seat_ids.to_vec())
                     }
                     Err(i) => {
                         // Safety net: simulation.rs no llama a deselect_seats
-                        // cuando book_seats falla, así que liberamos aquí los
-                        // asientos que sigan en SELECCIONADA para no perderlos.
+                        // cuando book_seats falla; liberamos las reservas pendientes.
                         for &idx in &idxs {
                             if s.seats[idx]
-                                .compare_exchange(SELECCIONADA, LIBRE, Ordering::AcqRel, Ordering::Acquire)
+                                .compare_exchange(
+                                    SELECCIONADA,
+                                    LIBRE,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                )
                                 .is_ok()
                             {
-                                s.available.0.fetch_add(1, Ordering::AcqRel);
+                                s.available.add(1);
                             }
                         }
                         Err(format!("Seat {} must be selected before booking", s.ids[i]))
