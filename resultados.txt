@@ -1,0 +1,61 @@
+
+running 2 tests
+
+=======================================================
+  INICIANDO TEST DE PERFILADO (CONCURRENT QUEUE)
+=======================================================
+test tests::test_sequential_booking_correctness ... ok
+Aforo total a vender: 22500 entradas
+
+------------------ RESULTADOS ------------------
+Tiempo real:          366.02ms
+Tiempo simulado:      10.17 horas
+THROUGHPUT OBTENIDO:  2213.00 tickets/hora
+Entradas vendidas:    22500/22500
+Estado del recinto:   100% vendido, 0 duplicados (CORRECTO)
+=======================================================
+
+test queue_manager::tests::test_full_profile ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
+
+
+running 35 tests
+test tests::t02_single_seat_numbered ... ok
+test tests::t05_three_seats_numbered ... ok
+test tests::t04_two_seats_general ... ok
+test tests::t03_single_seat_general ... ok
+test tests::t14_ticket_id_format ... ok
+test tests::t15_per_sector_completeness ... ok
+test tests::t17_capacity_equals_max_tickets ... ok
+test tests::t07_only_numbered_sectors ... ok
+test tests::t18_capacity_less_than_max_tickets ... ok
+test tests::t09_many_tiny_sectors ... ok
+test tests::t08_mixed_balanced ... ok
+test tests::t19_capacity_consistency ... ok
+test tests::t22_booker_unit_select_book ... ok
+test tests::t23_booker_unit_select_deselect ... ok
+test tests::t24_booker_double_select_fails ... ok
+test tests::t25_booker_book_without_select_fails ... ok
+test tests::t26_booker_general_select_book ... ok
+test tests::t27_booker_general_deselect ... ok
+test tests::t10_large_general ... ok
+test tests::t11_large_numbered ... ok
+test tests::t28_remaining_reaches_zero ... ok
+test tests::t01_default_venue_correctness ... ok
+test tests::t06_only_general_sectors ... ok
+test tests::t34_fuga_plazas_rollback_atomico_en_fallo_parcial ... ok
+test tests::t21_tickets_belong_to_known_sectors ... ok
+test tests::t33_fuga_plazas_numeradas_contencion_y_rollback ... ok
+test tests::t16_imbalanced_venue ... ok
+test queue_manager::tests::test_full_profile ... ok
+test tests::t12_repeatability_stress ... ok
+test tests::t20_stress_numbered_only ... ok
+test tests::t32_fuga_plazas_general_cancelaciones_masivas ... ok
+test tests::t29_stress_many_generals ... ok
+test tests::t30_global_id_uniqueness ... ok
+test tests::t13_repeatability_medium ... ok
+test tests::t31_performance_vs_baseline ... ok
+
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.50s
+

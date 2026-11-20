@@ -33,26 +33,17 @@ impl QueueManager for SequentialQueueManager {
     }
 }
 
-/// Parámetros de concurrencia (ajustables según perfilado en la máquina de evaluación).
+/// Parámetros de concurrencia.
 /// Como `simulate_booking` pasa la mayor parte del tiempo en `thread::sleep`,
 /// lanzar varios hilos por núcleo solapa las esperas sin saturar la CPU.
-const THREADS_PER_CORE: usize = 8;
-const MAX_THREADS: usize = 128;
+const MAX_THREADS: usize = 512;
+const MIN_TAIL_WORKERS: usize = 16;
 
 fn n_threads(capacity: usize) -> usize {
-    let cores = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-
-    let target = if capacity <= 50 {
-        capacity.max(1)
-    } else if capacity <= 500 {
-        (cores * 2).min(capacity)
-    } else {
-        (cores * THREADS_PER_CORE).min(MAX_THREADS).min(capacity)
-    };
-
-    target.max(1)
+    (capacity / 4)
+        .max(capacity.min(MIN_TAIL_WORKERS))
+        .min(MAX_THREADS)
+        .max(1)
 }
 
 /// Implementación concurrente: pool de hilos que atienden sesiones de compra
@@ -71,32 +62,39 @@ impl QueueManager for ConcurrentQueueManager {
 
     fn run(&mut self) -> Vec<String> {
         let total_cap = self.booker.get_total_capacity();
+        if total_cap == 0 {
+            return Vec::new();
+        }
+
         let num_workers = n_threads(total_cap);
+        let min_active = MIN_TAIL_WORKERS.min(num_workers);
         let mut sold_tickets = Vec::with_capacity(total_cap);
         let per_worker_cap = (total_cap / num_workers).max(64);
 
         thread::scope(|scope| {
             let workers: Vec<_> = (0..num_workers)
-                .map(|_| {
+                .map(|worker_id| {
                     let mut booker = self.booker.clone();
                     scope.spawn(move || {
                         let mut mis_tickets = Vec::with_capacity(per_worker_cap);
-                        let mut tail_fails: u32 = 0;
-                        while booker.remaining_seats() > 0 {
+                        loop {
+                            let left = booker.remaining_seats();
+                            if left == 0 {
+                                break;
+                            }
+
+                            // Reducción progresiva de hilos activos en la cola final:
+                            // evita la estampida de cientos de hilos sin caer a 1 solo hilo.
+                            let active_workers = left
+                                .saturating_mul(4)
+                                .clamp(min_active, num_workers);
+                            if worker_id >= active_workers {
+                                thread::sleep(std::time::Duration::from_micros(200));
+                                continue;
+                            }
+
                             let tickets = simulate_booking(&mut booker);
-                            if tickets.is_empty() {
-                                if booker.remaining_seats() <= num_workers * 2 {
-                                    tail_fails = tail_fails.saturating_add(1);
-                                    if tail_fails <= 2 {
-                                        std::hint::spin_loop();
-                                    } else if tail_fails <= 6 {
-                                        thread::yield_now();
-                                    } else {
-                                        thread::sleep(std::time::Duration::from_micros(30));
-                                    }
-                                }
-                            } else {
-                                tail_fails = 0;
+                            if !tickets.is_empty() {
                                 mis_tickets.extend(tickets);
                             }
                         }

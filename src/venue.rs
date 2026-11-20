@@ -96,15 +96,24 @@ impl Sector {
     }
 
     pub fn get_available_seats(&self) -> Vec<&Seat> {
-        self.seats.iter().filter(|s| s.state == SeatState::Available).collect()
+        self.seats
+            .iter()
+            .filter(|s| s.state == SeatState::Available)
+            .collect()
     }
 
     pub fn n_available_seats(&self) -> usize {
-        self.seats.iter().filter(|s| s.state == SeatState::Available).count()
+        self.seats
+            .iter()
+            .filter(|s| s.state == SeatState::Available)
+            .count()
     }
 
     pub fn n_booked_seats(&self) -> usize {
-        self.seats.iter().filter(|s| s.state == SeatState::Booked).count()
+        self.seats
+            .iter()
+            .filter(|s| s.state == SeatState::Booked)
+            .count()
     }
 }
 
@@ -179,8 +188,12 @@ pub struct SectorGeneral {
     pub code: String,
     pub capacity: usize,
     pub available: Contador,
+    pub selected: Contador,
     pub booked: Contador,
     pub next_ticket: Contador,
+    /// IDs que ya venían en estado `Booked` en el `Venue` inicial (vacío en el caso normal).
+    pub initial_booked_ids: Vec<String>,
+    /// IDs disponibles para emitir (todos los no vendidos inicialmente).
     pub ids: Vec<String>,
 }
 
@@ -283,14 +296,30 @@ impl ConcurrentVenue {
                     available: ContadorIsize::new(available),
                 }));
             } else {
+                let selected = s
+                    .seats
+                    .iter()
+                    .filter(|seat| seat.state == SeatState::Selected)
+                    .count();
+                let mut initial_booked_ids = Vec::with_capacity(booked);
+                let mut ids = Vec::with_capacity(s.seats.len().saturating_sub(booked));
+                for seat in &s.seats {
+                    if seat.state == SeatState::Booked {
+                        initial_booked_ids.push(seat.id.clone());
+                    } else {
+                        ids.push(seat.id.clone());
+                    }
+                }
                 sectors.push(SectorConcurrente::General(SectorGeneral {
                     name: s.name.clone(),
                     code: s.code.clone(),
                     capacity: s.capacity,
                     available: Contador::new(available),
+                    selected: Contador::new(selected),
                     booked: Contador::new(booked),
-                    next_ticket: Contador::new(booked),
-                    ids: s.seats.iter().map(|seat| seat.id.clone()).collect(),
+                    next_ticket: Contador::new(0),
+                    initial_booked_ids,
+                    ids,
                 }));
             }
         }
@@ -318,24 +347,28 @@ impl ConcurrentVenue {
                     let booked = s.booked.get();
                     let available = s.available.get();
                     let selected = s.capacity.saturating_sub(booked + available);
-                    let seats = s
-                        .ids
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, id)| {
-                            let i = idx + 1;
-                            Seat {
-                                id: id.clone(),
-                                state: if i <= booked {
-                                    SeatState::Booked
-                                } else if i <= booked + selected {
-                                    SeatState::Selected
-                                } else {
-                                    SeatState::Available
-                                },
-                            }
-                        })
-                        .collect();
+                    let newly_booked = booked.saturating_sub(s.initial_booked_ids.len());
+
+                    let mut seats = Vec::with_capacity(s.capacity);
+                    for id in &s.initial_booked_ids {
+                        seats.push(Seat {
+                            id: id.clone(),
+                            state: SeatState::Booked,
+                        });
+                    }
+                    for (idx, id) in s.ids.iter().enumerate() {
+                        seats.push(Seat {
+                            id: id.clone(),
+                            state: if idx < newly_booked {
+                                SeatState::Booked
+                            } else if idx < newly_booked + selected {
+                                SeatState::Selected
+                            } else {
+                                SeatState::Available
+                            },
+                        });
+                    }
+
                     Sector {
                         name: s.name.clone(),
                         code: s.code.clone(),

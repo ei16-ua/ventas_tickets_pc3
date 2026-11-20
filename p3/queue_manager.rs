@@ -36,8 +36,10 @@ impl QueueManager for SequentialQueueManager {
 /// Parámetros de concurrencia (ajustables según perfilado en la máquina de evaluación).
 /// Como `simulate_booking` pasa la mayor parte del tiempo en `thread::sleep`,
 /// lanzar varios hilos por núcleo solapa las esperas sin saturar la CPU.
-const THREADS_PER_CORE: usize = 8;
-const MAX_THREADS: usize = 128;
+const THREADS_PER_CORE: usize = 32;
+const MAX_THREADS: usize = 512;
+/// Por debajo de este aforo restante solo el hilo 0 sigue abriendo sesiones.
+const TAIL: usize = 32;
 
 fn n_threads(capacity: usize) -> usize {
     let cores = thread::available_parallelism()
@@ -77,26 +79,23 @@ impl QueueManager for ConcurrentQueueManager {
 
         thread::scope(|scope| {
             let workers: Vec<_> = (0..num_workers)
-                .map(|_| {
+                .map(|worker_id| {
                     let mut booker = self.booker.clone();
                     scope.spawn(move || {
                         let mut mis_tickets = Vec::with_capacity(per_worker_cap);
-                        let mut tail_fails: u32 = 0;
-                        while booker.remaining_seats() > 0 {
+                        loop {
+                            let left = booker.remaining_seats();
+                            if left == 0 {
+                                break;
+                            }
+                            // Entre sesiones no hay butacas en SELECCIONADA: el resto
+                            // puede esperar sin dejar reservas colgadas.
+                            if left <= TAIL && worker_id != 0 {
+                                thread::sleep(std::time::Duration::from_micros(200));
+                                continue;
+                            }
                             let tickets = simulate_booking(&mut booker);
-                            if tickets.is_empty() {
-                                if booker.remaining_seats() <= num_workers * 2 {
-                                    tail_fails = tail_fails.saturating_add(1);
-                                    if tail_fails <= 2 {
-                                        std::hint::spin_loop();
-                                    } else if tail_fails <= 6 {
-                                        thread::yield_now();
-                                    } else {
-                                        thread::sleep(std::time::Duration::from_micros(30));
-                                    }
-                                }
-                            } else {
-                                tail_fails = 0;
+                            if !tickets.is_empty() {
                                 mis_tickets.extend(tickets);
                             }
                         }
