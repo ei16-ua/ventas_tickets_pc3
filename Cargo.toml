@@ -2,10 +2,27 @@
 name = "tickets"
 version = "0.1.0"
 edition = "2021"
+default-run = "tickets"
+
+[[bin]]
+name = "tickets"
+path = "src/main.rs"
 
 [[bin]]
 name = "main2"
 path = "src/main2.rs"
+
+[[bin]]
+name = "main3"
+path = "src/main3.rs"
+
+[[bin]]
+name = "main4"
+path = "src/main4.rs"
+
+[[bin]]
+name = "main5"
+path = "src/main5.rs"
 
 [dependencies]
 rand = "0.9.2"
